@@ -247,6 +247,9 @@ async function main() {
     console.log("📥 Fetching GitHub activity...");
 
     const commits = await fetchCommits();
+
+    console.log(`✅ Fetched ${commits.length} commits`);
+    
     const prs = await fetchPRs();
 
     console.log(`📦 Commits: ${commits.length}`);
