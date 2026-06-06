@@ -1,0 +1,1 @@
+powershell -ExecutionPolicy Bypass -File cron.ps1

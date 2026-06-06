@@ -30,11 +30,17 @@ function getDateString() {
    OLLAMA BOOT
 ----------------------------*/
 
-function isOllamaRunning() {
+async function isOllamaRunning() {
+    const axios = require("axios");
+
     try {
-        execSync("curl http://localhost:11434/api/tags", { stdio: "ignore" });
-        return true;
-    } catch {
+        const res = await axios.get("http://localhost:11434/api/tags", {
+            timeout: 2000
+        });
+
+        // extra safety check
+        return res.status === 200 && res.data;
+    } catch (e) {
         return false;
     }
 }
@@ -167,40 +173,8 @@ function isNoise(msg) {
         m.length < 5
     );
 }
-function classify(msg) {
-    const m = msg.toLowerCase();
 
-    if (m.includes("fix")) return "fix";
-    if (m.includes("remove")) return "cleanup";
-    if (m.includes("refactor")) return "refactor";
-    if (m.includes("add") || m.includes("feat")) return "feature";
-    if (m.includes("update")) return "update";
 
-    return "general";
-}
-function groupByType(data) {
-    const result = {};
-
-    for (const repo in data) {
-        const grouped = {
-            feature: [],
-            fix: [],
-            refactor: [],
-            cleanup: [],
-            update: [],
-            general: []
-        };
-
-        for (const msg of data[repo]) {
-            const type = classify(msg);
-            grouped[type].push(msg);
-        }
-
-        result[repo] = grouped;
-    }
-
-    return result;
-}
 /* ---------------------------
    OLLAMA REPORT GENERATION
 ----------------------------*/
@@ -215,57 +189,37 @@ RULES:
 - Do NOT regroup items
 - Do NOT reorder items
 - Do NOT merge across categories
-- Only convert each category into human readable bullets
 - Keep repository structure unchanged
+- Merge only closely related tasks within the same category
+- Each bullet must be 5-15 words
+- Maximum 5 bullets per category
+- Focus on WHAT changed, not WHY it matters
+- Do NOT add business justification
+- Do NOT mention user experience, growth, company goals, platform vision, scalability, reliability, etc. unless explicitly present in the work items
+- Remove repetitive details
+- Use concise engineering language
 
-OUTPUT FORMAT:
-# Daily Work Report
-
-## Repo Name
-
-### Features
-- ...
-
-### Fixes
-- ...
-
-### Refactoring
-- ...
-
-### Cleanup
-- ...
-
-### Updates
-- ...
---------------------------------
 STYLE:
---------------------------------
+- Short
+- Professional
+- Engineering-focused
+- One sentence per bullet
 
-- Human readable
-- Simple business summary
-- Merge similar work
-
---------------------------------
-EXAMPLE OUTPUT:
---------------------------------
+EXAMPLE:
 
 # Daily Work Report
 
-## SkillTrack
-- Improved quiz system performance and reliability
-- Enhanced overall system stability
+## LMS Backend
+- Added course, category, and instructor management pages
+- Implemented navigation menu icon support
+- Updated menu validation rules and form fields
+- Added course statistics dashboard widgets
+- Removed unused P2P Trading and Virtual Card templates
 
-## TradeLink Frontend
-- Improved user interface consistency
-- Enhanced navigation and layout experience
-
---------------------------------
 INPUT:
---------------------------------
 
-${JSON.stringify(simplify(data))}
+${JSON.stringify((data))}
 `;
-
     console.log("🧠 Sending prompt to Ollama...", prompt);
 
     console.log("⏳ Waiting for Ollama response...");
@@ -307,7 +261,7 @@ async function main() {
     console.log("🔍 Initializing system...");
 
     // Start Ollama if needed
-    if (!isOllamaRunning()) {
+    if (!(await isOllamaRunning())) {
         startOllama();
         console.log("⏳ Waiting for Ollama...");
         await new Promise(r => setTimeout(r, 4000));
