@@ -3,14 +3,15 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const { spawn, execSync } = require("child_process");
+const { execSync } = require("child_process");
 const { log } = require("console");
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
-const MODEL = process.env.OLLAMA_MODEL || "qwen3:4b";
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const MODEL = process.env.MISTRAL_MODEL || "mistral-small-latest";
 
-const OLLAMA_URL = "http://localhost:11434/api/generate";
+const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
 
 /* ---------------------------
    DATE HELPERS
@@ -24,34 +25,6 @@ function getStartOfDayISO() {
 
 function getDateString() {
     return new Date().toISOString().split("T")[0];
-}
-
-/* ---------------------------
-   OLLAMA BOOT
-----------------------------*/
-
-async function isOllamaRunning() {
-    const axios = require("axios");
-
-    try {
-        const res = await axios.get("http://localhost:11434/api/tags", {
-            timeout: 2000
-        });
-
-        // extra safety check
-        return res.status === 200 && res.data;
-    } catch (e) {
-        return false;
-    }
-}
-
-function startOllama() {
-    console.log("🚀 Starting Ollama...");
-    const p = spawn("ollama", ["serve"], {
-        detached: true,
-        stdio: "ignore"
-    });
-    p.unref();
 }
 
 /* ---------------------------
@@ -176,8 +149,8 @@ function isNoise(msg) {
 
 
 /* ---------------------------
-   OLLAMA REPORT GENERATION
-----------------------------*/
+   MISTRAL REPORT GENERATION
+ ----------------------------*/
 
 async function generateReport(data) {
     const prompt = `
@@ -191,8 +164,8 @@ RULES:
 - Do NOT merge across categories
 - Keep repository structure unchanged
 - Merge only closely related tasks within the same category
-- Each bullet must be 5-15 words
-- Maximum 5 bullets per category
+- Each bullet must be 5-10 words
+- Minimum 1 bullet per category
 - Focus on WHAT changed, not WHY it matters
 - Do NOT add business justification
 - Do NOT mention user experience, growth, company goals, platform vision, scalability, reliability, etc. unless explicitly present in the work items
@@ -220,22 +193,33 @@ INPUT:
 
 ${JSON.stringify((data))}
 `;
-    console.log("🧠 Sending prompt to Ollama...", prompt);
+    console.log("🧠 Sending prompt to Mistral...", prompt);
 
-    console.log("⏳ Waiting for Ollama response...");
+    console.log("⏳ Waiting for Mistral response...");
 
-    const res = await axios.post(OLLAMA_URL, {
-        model: MODEL,
-        prompt,
-        stream: false,
-        options: {
-            num_ctx: 2048,     // safer for large repos
-            temperature: 0.1,  // even more stable
-            top_p: 0.7
+    const res = await axios.post(
+        MISTRAL_URL,
+        {
+            model: MODEL,
+            messages: [
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+            temperature: 0.1,
+            top_p: 0.7,
+            max_tokens: 2000,
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${MISTRAL_API_KEY}`,
+                "Content-Type": "application/json",
+            },
         }
-    });
+    );
 
-    return res.data.response;
+    return res.data.choices[0].message.content;
 }
 
 /* ---------------------------
@@ -259,15 +243,6 @@ function ensureFolders() {
 
 async function main() {
     console.log("🔍 Initializing system...");
-
-    // Start Ollama if needed
-    if (!(await isOllamaRunning())) {
-        startOllama();
-        console.log("⏳ Waiting for Ollama...");
-        await new Promise(r => setTimeout(r, 4000));
-    } else {
-        console.log("✅ Ollama already running");
-    }
 
     console.log("📥 Fetching GitHub activity...");
 
