@@ -165,7 +165,7 @@ RULES:
 - Keep repository structure unchanged
 - Merge only closely related tasks within the same category
 - Each bullet must be 5-10 words
-- Minimum 1 bullet per category
+- Minimum 1 bullet per category, no maximum limit
 - Focus on WHAT changed, not WHY it matters
 - Do NOT add business justification
 - Do NOT mention user experience, growth, company goals, platform vision, scalability, reliability, etc. unless explicitly present in the work items
@@ -178,7 +178,7 @@ STYLE:
 - Engineering-focused
 - One sentence per bullet
 
-EXAMPLE:
+Follow EXAMPLE:
 
 # Daily Work Report
 
@@ -207,9 +207,6 @@ ${JSON.stringify((data))}
                     content: prompt,
                 },
             ],
-            temperature: 0.1,
-            top_p: 0.7,
-            max_tokens: 2000,
         },
         {
             headers: {
@@ -249,7 +246,7 @@ async function main() {
     const commits = await fetchCommits();
 
     console.log(`✅ Fetched ${commits.length} commits`);
-    
+
     const prs = await fetchPRs();
 
     console.log(`📦 Commits: ${commits.length}`);
