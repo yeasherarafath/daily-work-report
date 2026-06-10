@@ -34,19 +34,69 @@ function getDateString() {
 async function fetchCommits() {
     const since = getStartOfDayISO();
 
-    const query = `author:${GITHUB_USERNAME} committer-date:>${since}`;
-
-    const url =
-        `https://api.github.com/search/commits?q=${encodeURIComponent(query)}`;
+    const url = `https://api.github.com/users/${GITHUB_USERNAME}/events?per_page=100`;
 
     const res = await axios.get(url, {
         headers: {
             Authorization: `Bearer ${GITHUB_TOKEN}`,
-            Accept: "application/vnd.github.cloak-preview+json"
+            Accept: "application/vnd.github+json"
         }
     });
 
-    return res.data.items || [];
+    const events = res.data || [];
+    
+    // Find all unique repo and branch pairs pushed today
+    const pushedBranches = new Map(); // key: "repo/branch", value: { repo, branch }
+
+    for (const event of events) {
+        if (event.type !== "PushEvent") continue;
+        if (new Date(event.created_at) < new Date(since)) continue;
+
+        const repo = event.repo?.name;
+        const ref = event.payload?.ref;
+
+        if (repo && ref && ref.startsWith("refs/heads/")) {
+            const branch = ref.replace("refs/heads/", "");
+            const key = `${repo}:${branch}`;
+            pushedBranches.set(key, { repo, branch });
+        }
+    }
+
+    const commits = [];
+    const seenShas = new Set();
+
+    // Fetch commits for each pushed branch since today
+    for (const { repo, branch } of pushedBranches.values()) {
+        try {
+            const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}`;
+            const commitsRes = await axios.get(commitsUrl, {
+                headers: {
+                    Authorization: `Bearer ${GITHUB_TOKEN}`,
+                    Accept: "application/vnd.github+json"
+                }
+            });
+
+            const branchCommits = commitsRes.data || [];
+            for (const c of branchCommits) {
+                if (c.sha && !seenShas.has(c.sha)) {
+                    seenShas.add(c.sha);
+                    commits.push({
+                        sha: c.sha,
+                        repository: {
+                            full_name: repo
+                        },
+                        commit: {
+                            message: c.commit?.message || ""
+                        }
+                    });
+                }
+            }
+        } catch (err) {
+            console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
+        }
+    }
+
+    return commits;
 }
 
 /* ---------------------------
