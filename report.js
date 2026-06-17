@@ -44,7 +44,7 @@ async function fetchCommits() {
     });
 
     const events = res.data || [];
-    
+
     // Find all unique repo and branch pairs pushed today
     const pushedBranches = new Map(); // key: "repo/branch", value: { repo, branch }
 
@@ -203,45 +203,72 @@ function isNoise(msg) {
  ----------------------------*/
 
 async function generateReport(data) {
-    const prompt = `
-You are a senior engineering manager.
+    const prompt = `You are a senior engineering manager writing a daily engineering progress report.
 
-You will receive pre-grouped engineering work.
+You will receive commit messages grouped by repository.
+
+GOAL:
+Transform commit history into high-level engineering delivery summaries that reflect completed systems, features, and meaningful technical work.
+
+CORE RULE:
+Think in terms of “what was delivered to the system”, not “what was changed in code”.
 
 RULES:
-- Do NOT regroup items
-- Do NOT reorder items
-- Do NOT merge across categories
-- Keep repository structure unchanged
-- Merge only closely related tasks within the same category
-- Each bullet must be 5-10 words
-- Minimum 1 bullet per category, no maximum limit
-- Focus on WHAT changed, not WHY it matters
-- Do NOT add business justification
-- Do NOT mention user experience, growth, company goals, platform vision, scalability, reliability, etc. unless explicitly present in the work items
-- Remove repetitive details
-- Use concise engineering language
 
-STYLE:
-- Short
-- Professional
-- Engineering-focused
-- One sentence per bullet
+Keep repository names and order unchanged.
+Do NOT output commit-level details.
+Merge all related commits into system-level or feature-level outcomes.
+Each bullet must represent a completed engineering deliverable (feature, module, subsystem, or significant enhancement).
+Use senior engineering language (system, lifecycle, workflow, architecture, capability, module).
+Avoid technical noise such as individual methods, files, or minor refactors.
+Group UI, backend, database, API, and tests under one coherent feature when related.
+Ignore trivial changes unless they contribute to a larger system change.
+No repetition of the same feature across bullets.
 
-Follow EXAMPLE:
+TONE:
 
-# Daily Work Report
+Senior engineering manager level
+Concise, structured, and authoritative
+Focus on systems and capabilities, not implementation steps
+No commit-style wording (“added”, “fixed”, “refactored”) unless part of a broader system description
 
-## LMS Backend
-- Added course, category, and instructor management pages
-- Implemented navigation menu icon support
-- Updated menu validation rules and form fields
-- Added course statistics dashboard widgets
-- Removed unused P2P Trading and Virtual Card templates
+QUANTITY:
+
+Minimum 7 bullets per repository when sufficient scope exists
+Maximum 12 bullets per repository
+If work is small, naturally consolidate into fewer but higher-level system descriptions
+
+WRITING STYLE:
+
+Each bullet should describe a delivered capability or subsystem
+8–16 words per bullet
+Prefer nouns over verbs (e.g., “activation management system”, not “added activation system”)
+Avoid explanations, benefits, or storytelling
+
+EXAMPLES:
+
+BAD:
+
+Added activation page
+Fixed modal UI
+Updated validation logic
+
+GOOD:
+
+Activation management system with lifecycle tracking and bulk operations
+Standardized administrative UI components across modal interfaces
+Enhanced license validation and rule enforcement layer
+
+OUTPUT FORMAT:
+
+Todays Work
+---------------
+Repository Name
+System-level deliverable
+System-level deliverable
 
 INPUT:
-
-${JSON.stringify((data))}
+${JSON.stringify(data)}
 `;
     console.log("🧠 Sending prompt to Mistral...", prompt);
 
