@@ -118,7 +118,33 @@ async function fetchPRs() {
         }
     });
 
-    return res.data.items || [];
+    const items = res.data.items || [];
+
+    for (const item of items) {
+        const repoFull = item.repository_url
+            ? item.repository_url.split("/").slice(-2).join("/")
+            : null;
+        if (!repoFull || !item.number) continue;
+
+        try {
+            const commitsUrl = `https://api.github.com/repos/${repoFull}/pulls/${item.number}/commits`;
+            const commitsRes = await axios.get(commitsUrl, {
+                headers: {
+                    Authorization: `Bearer ${GITHUB_TOKEN}`,
+                    Accept: "application/vnd.github+json"
+                }
+            });
+            item.pr_commits = (commitsRes.data || []).map(c => ({
+                sha: c.sha,
+                message: c.commit?.message || ""
+            }));
+        } catch (err) {
+            console.error(`⚠️ Failed to fetch commits for PR #${item.number} in ${repoFull}:`, err.message);
+            item.pr_commits = [];
+        }
+    }
+
+    return items;
 }
 
 /* ---------------------------
@@ -127,6 +153,7 @@ async function fetchPRs() {
 
 function groupData(commits, prs) {
     const grouped = {};
+    const seenShas = new Set();
 
     for (const c of commits) {
         const repo = c.repository.full_name;
@@ -136,6 +163,7 @@ function groupData(commits, prs) {
         grouped[repo].commits.push({
             message: c.commit.message,
         });
+        if (c.sha) seenShas.add(c.sha);
     }
 
     for (const p of prs) {
@@ -147,7 +175,17 @@ function groupData(commits, prs) {
 
         grouped[repo].prs.push({
             title: p.title,
+            commits: (p.pr_commits || []).map(c => c.message),
         });
+
+        for (const c of (p.pr_commits || [])) {
+            if (!seenShas.has(c.sha)) {
+                seenShas.add(c.sha);
+                grouped[repo].commits.push({
+                    message: c.message,
+                });
+            }
+        }
     }
 
     return grouped;
@@ -234,8 +272,8 @@ No commit-style wording (“added”, “fixed”, “refactored”) unless part
 
 QUANTITY:
 
-Minimum 7 bullets per repository when sufficient scope exists
-Maximum 12 bullets per repository
+Minimum 12 bullets per repository when sufficient scope exists
+Maximum 22 bullets per repository
 If work is small, naturally consolidate into fewer but higher-level system descriptions
 
 WRITING STYLE:
@@ -335,6 +373,14 @@ async function main() {
 
     const report = await generateReport(grouped);
 
+    writeReportToFile(report);
+
+    console.log("\n✅ DONE");
+    console.log("📄 today-work.md updated");
+    console.log(`📁 reports/${date}.md created`);
+}
+
+function writeReportToFile(report) {
     const date = getDateString();
 
     const reportsDir = ensureFolders();
@@ -344,10 +390,6 @@ async function main() {
 
     fs.writeFileSync(todayFile, report);
     fs.writeFileSync(historyFile, report);
-
-    console.log("\n✅ DONE");
-    console.log("📄 today-work.md updated");
-    console.log(`📁 reports/${date}.md created`);
 }
 
 main().catch(console.error);
