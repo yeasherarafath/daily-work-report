@@ -374,6 +374,7 @@ async function main() {
     const report = await generateReport(grouped);
 
     writeReportToFile(report);
+    const date = getDateString();
 
     console.log("\n✅ DONE");
     console.log("📄 today-work.md updated");
