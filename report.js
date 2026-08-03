@@ -283,6 +283,8 @@ Each bullet should describe a delivered capability or subsystem
 Prefer nouns over verbs (e.g., “activation management system”, not “added activation system”)
 Avoid explanations, benefits, or storytelling
 
+make this list more easy to read for fully non tech person, he is ceo
+
 EXAMPLES:
 
 BAD:
