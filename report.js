@@ -8,10 +8,15 @@ const { log } = require("console");
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const MODEL = process.env.MISTRAL_MODEL || "mistral-small-latest";
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const REASONING_EFFORT = process.env.GROQ_REASONING_EFFORT;
 
-const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+const GROQ_TIMEOUT = 180000; // 3 min, stays under cron.ps1's 300s process kill
+const MAX_LLM_RETRIES = 3;
+const MAX_COMPLETION_TOKENS = 8192;
 
 /* ---------------------------
    DATE HELPERS
@@ -237,7 +242,98 @@ function isNoise(msg) {
 
 
 /* ---------------------------
-   MISTRAL REPORT GENERATION
+   GROQ REQUEST HELPERS
+----------------------------*/
+
+/**
+ * Reasoning models (gpt-oss, qwen3) can emit their chain of thought inline in
+ * the message content. Strip it so it never reaches today-work.md.
+ * Also handles an unterminated opening tag, which happens on truncated output.
+ */
+function stripReasoning(text) {
+    return text
+        .replace(/<think>[\s\S]*?<\/think>/gi, "")
+        .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "")
+        .replace(/<think>[\s\S]*$/i, "")
+        .replace(/<reasoning>[\s\S]*$/i, "")
+        .trim();
+}
+
+/** 429 and 5xx are transient. A missing response means network error or timeout. */
+function isRetryable(err) {
+    const status = err.response && err.response.status;
+
+    if (!status) return true;
+
+    return status === 429 || status >= 500;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * POST the prompt to Groq, retrying transient failures with exponential
+ * backoff. Config errors (400/401/404) fail immediately instead of burning
+ * three timeouts on a mistake that will not fix itself.
+ */
+async function requestCompletion(prompt) {
+    const body = {
+        model: MODEL,
+        messages: [
+            {
+                role: "user",
+                content: prompt,
+            },
+        ],
+        temperature: 0.6,
+        top_p: 0.95,
+        max_completion_tokens: MAX_COMPLETION_TOKENS,
+        ...(REASONING_EFFORT ? { reasoning_effort: REASONING_EFFORT } : {}),
+    };
+
+    const config = {
+        headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json",
+        },
+        timeout: GROQ_TIMEOUT,
+    };
+
+    let lastError;
+
+    for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
+        try {
+            return await axios.post(GROQ_URL, body, config);
+        } catch (err) {
+            lastError = err;
+
+            const status = err.response && err.response.status;
+
+            console.error(
+                `❌ Groq request failed (attempt ${attempt}/${MAX_LLM_RETRIES})` +
+                    (status ? ` HTTP ${status}` : ` ${err.code || err.message}`)
+            );
+
+            if (err.response && err.response.data) {
+                console.error(JSON.stringify(err.response.data));
+            }
+
+            if (!isRetryable(err) || attempt === MAX_LLM_RETRIES) break;
+
+            const delay = Math.pow(2, attempt) * 1000;
+
+            console.log(`⏳ Retrying in ${delay / 1000}s...`);
+
+            await sleep(delay);
+        }
+    }
+
+    throw lastError;
+}
+
+/* ---------------------------
+   GROQ REPORT GENERATION
  ----------------------------*/
 
 async function generateReport(data) {
@@ -310,30 +406,30 @@ System-level deliverable
 INPUT:
 ${JSON.stringify(data)}
 `;
-    console.log("🧠 Sending prompt to Mistral...", prompt);
+    if (!GROQ_API_KEY) {
+        throw new Error("GROQ_API_KEY is missing. Add it to .env (see .env.example).");
+    }
 
-    console.log("⏳ Waiting for Mistral response...");
+    console.log("🧠 Sending prompt to Groq...", prompt);
 
-    const res = await axios.post(
-        MISTRAL_URL,
-        {
-            model: MODEL,
-            messages: [
-                {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
-        },
-        {
-            headers: {
-                Authorization: `Bearer ${MISTRAL_API_KEY}`,
-                "Content-Type": "application/json",
-            },
-        }
-    );
+    console.log(`⏳ Waiting for Groq response (${MODEL})...`);
 
-    return res.data.choices[0].message.content;
+    const res = await requestCompletion(prompt);
+
+    const choice = res.data && res.data.choices && res.data.choices[0];
+
+    if (!choice || !choice.message || typeof choice.message.content !== "string") {
+        throw new Error(`Unexpected Groq response shape: ${JSON.stringify(res.data)}`);
+    }
+
+    if (choice.finish_reason === "length") {
+        console.warn(
+            `⚠️  Report was TRUNCATED - hit max_completion_tokens (${MAX_COMPLETION_TOKENS}). ` +
+                "Raise MAX_COMPLETION_TOKENS or reduce the number of repositories."
+        );
+    }
+
+    return stripReasoning(choice.message.content);
 }
 
 /* ---------------------------
