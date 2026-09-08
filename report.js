@@ -312,7 +312,7 @@ async function requestCompletion(prompt) {
 
             console.error(
                 `❌ Groq request failed (attempt ${attempt}/${MAX_LLM_RETRIES})` +
-                    (status ? ` HTTP ${status}` : ` ${err.code || err.message}`)
+                (status ? ` HTTP ${status}` : ` ${err.code || err.message}`)
             );
 
             if (err.response && err.response.data) {
@@ -397,11 +397,11 @@ Enhanced license validation and rule enforcement layer
 
 OUTPUT FORMAT:
 
-Todays Work
+# Today's Work
 ---------------
-Repository Name
-System-level deliverable
-System-level deliverable
+## Repository Name
+- System-level deliverable
+- System-level deliverable
 
 INPUT:
 ${JSON.stringify(data)}
@@ -425,7 +425,7 @@ ${JSON.stringify(data)}
     if (choice.finish_reason === "length") {
         console.warn(
             `⚠️  Report was TRUNCATED - hit max_completion_tokens (${MAX_COMPLETION_TOKENS}). ` +
-                "Raise MAX_COMPLETION_TOKENS or reduce the number of repositories."
+            "Raise MAX_COMPLETION_TOKENS or reduce the number of repositories."
         );
     }
 
