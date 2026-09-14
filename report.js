@@ -23,6 +23,9 @@ const GROQ_TIMEOUT = 180000; // 3 min, stays under cron.ps1's 300s process kill
 const MAX_LLM_RETRIES = 3;
 const MAX_COMPLETION_TOKENS = 8192;
 
+const MAX_REPO_PAGES = 5;
+const MAX_BRANCH_PAGES = 3;
+
 /* ---------------------------
    DATE HELPERS
 ----------------------------*/
@@ -66,10 +69,10 @@ async function searchCommits(dateField, date) {
     return items;
 }
 
-// Fallback discovery: branches pushed today, from the events feed.
-// Catches commits whose author date is older than today but were pushed today.
-async function fetchPushedBranches(since) {
-    const pushedBranches = new Map(); // key: "repo:branch", value: { repo, branch }
+// Repos this user pushed to today, from the events feed.
+// Only used to widen the repo list - branches come from the branches API.
+async function fetchReposFromEvents(since) {
+    const repos = new Set();
 
     // The events feed is capped at 300 and is NOT sorted by date, so all
     // three pages must be read or today's pushes can be missed.
@@ -88,20 +91,59 @@ async function fetchPushedBranches(since) {
         for (const event of events) {
             if (event.type !== "PushEvent") continue;
             if (new Date(event.created_at) < new Date(since)) continue;
-
-            const repo = event.repo?.name;
-            const ref = event.payload?.ref;
-
-            if (repo && ref && ref.startsWith("refs/heads/")) {
-                const branch = ref.replace("refs/heads/", "");
-                pushedBranches.set(`${repo}:${branch}`, { repo, branch });
-            }
+            if (event.repo?.name) repos.add(event.repo.name);
         }
 
         if (events.length < 100) break;
     }
 
-    return pushedBranches;
+    return repos;
+}
+
+// Repos touched today, across every affiliation. Sorted by push time, so the
+// walk stops at the first repo that went quiet before today.
+async function fetchActiveRepos(since) {
+    const repos = new Set();
+
+    for (let page = 1; page <= MAX_REPO_PAGES; page++) {
+        const url = `https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&direction=desc&per_page=100&page=${page}`;
+        let items;
+
+        try {
+            const res = await axios.get(url, { headers: GH_HEADERS });
+            items = res.data || [];
+        } catch (err) {
+            console.error(`⚠️ Failed to fetch repo page ${page}:`, err.message);
+            break;
+        }
+
+        let stop = false;
+        for (const r of items) {
+            if (!r.pushed_at || new Date(r.pushed_at) < new Date(since)) {
+                stop = true;
+                break;
+            }
+            repos.add(r.full_name);
+        }
+
+        if (stop || items.length < 100) break;
+    }
+
+    return repos;
+}
+
+async function fetchBranches(repo) {
+    const branches = [];
+
+    for (let page = 1; page <= MAX_BRANCH_PAGES; page++) {
+        const url = `https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`;
+        const res = await axios.get(url, { headers: GH_HEADERS });
+        const items = res.data || [];
+        branches.push(...items.map(b => b.name).filter(Boolean));
+        if (items.length < 100) break;
+    }
+
+    return branches;
 }
 
 async function fetchCommits() {
@@ -125,33 +167,54 @@ async function fetchCommits() {
         });
     };
 
+    const repos = new Set();
+
     // Primary source: commit search on both author date and committer date.
-    // committer-date catches rebased or cherry-picked work.
+    // committer-date catches rebased or cherry-picked work. Search only indexes
+    // each repo's DEFAULT branch, so it is a fast path, not full coverage.
     for (const field of ["author-date", "committer-date"]) {
         try {
             const items = await searchCommits(field, today);
             for (const c of items) {
-                add(c.sha, c.repository?.full_name, c.commit?.message);
+                const repo = c.repository?.full_name;
+                if (repo) repos.add(repo);
+                add(c.sha, repo, c.commit?.message);
             }
         } catch (err) {
             console.error(`⚠️ Commit search failed for ${field}:`, err.message);
         }
     }
 
-    // Fallback: walk branches pushed today. The events feed lags and sometimes
-    // drops private-repo pushes, so it only supplements the search above.
-    const pushedBranches = await fetchPushedBranches(since);
+    // Widen the repo list: everything pushed today, by any affiliation, plus
+    // the events feed as a backstop.
+    for (const r of await fetchActiveRepos(since)) repos.add(r);
+    for (const r of await fetchReposFromEvents(since)) repos.add(r);
 
-    for (const { repo, branch } of pushedBranches.values()) {
+    // Walk every branch of every active repo. This is what picks up work on
+    // feature branches, which commit search never returns.
+    for (const repo of repos) {
+        let branches;
+
         try {
-            const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}`;
-            const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
-
-            for (const c of (commitsRes.data || [])) {
-                add(c.sha, repo, c.commit?.message);
-            }
+            branches = await fetchBranches(repo);
         } catch (err) {
-            console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
+            console.error(`⚠️ Failed to fetch branches for ${repo}:`, err.message);
+            continue;
+        }
+
+        for (const branch of branches) {
+            try {
+                const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}&per_page=100`;
+                const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
+
+                for (const c of (commitsRes.data || [])) {
+                    add(c.sha, repo, c.commit?.message);
+                }
+            } catch (err) {
+                // 409 = empty repo, not worth reporting
+                if (err.response?.status === 409) continue;
+                console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
+            }
         }
     }
 
