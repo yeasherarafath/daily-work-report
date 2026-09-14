@@ -25,6 +25,7 @@ const MAX_COMPLETION_TOKENS = 8192;
 
 const MAX_REPO_PAGES = 5;
 const MAX_BRANCH_PAGES = 3;
+const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
 /* ---------------------------
    DATE HELPERS
@@ -132,18 +133,42 @@ async function fetchActiveRepos(since) {
     return repos;
 }
 
-async function fetchBranches(repo) {
-    const branches = [];
+// Branch heads, deduped by commit SHA. Stale branches that share a head with
+// another branch cost one commits request instead of several - the commits API
+// takes a raw SHA in ?sha= just as happily as a branch name.
+async function fetchBranchHeads(repo) {
+    const heads = new Map(); // key: head sha, value: branch name (for error output)
 
     for (let page = 1; page <= MAX_BRANCH_PAGES; page++) {
         const url = `https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`;
         const res = await axios.get(url, { headers: GH_HEADERS });
         const items = res.data || [];
-        branches.push(...items.map(b => b.name).filter(Boolean));
+
+        for (const b of items) {
+            if (b.commit?.sha && !heads.has(b.commit.sha)) heads.set(b.commit.sha, b.name);
+        }
+
         if (items.length < 100) break;
     }
 
-    return branches;
+    return heads;
+}
+
+// Runs tasks with a bounded number in flight. The branch walk is ~60 requests
+// of pure network wait, so serial execution wastes most of the runtime.
+async function runPooled(tasks, limit) {
+    const results = [];
+    let next = 0;
+
+    const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+        while (next < tasks.length) {
+            const i = next++;
+            results[i] = await tasks[i]();
+        }
+    });
+
+    await Promise.all(workers);
+    return results;
 }
 
 async function fetchCommits() {
@@ -169,53 +194,68 @@ async function fetchCommits() {
 
     const repos = new Set();
 
-    // Primary source: commit search on both author date and committer date.
-    // committer-date catches rebased or cherry-picked work. Search only indexes
-    // each repo's DEFAULT branch, so it is a fast path, not full coverage.
-    for (const field of ["author-date", "committer-date"]) {
+    const searchTasks = ["author-date", "committer-date"].map(field => async () => {
         try {
-            const items = await searchCommits(field, today);
-            for (const c of items) {
-                const repo = c.repository?.full_name;
-                if (repo) repos.add(repo);
-                add(c.sha, repo, c.commit?.message);
-            }
+            // Search only indexes each repo's DEFAULT branch, so this is a fast
+            // path, not full coverage. committer-date catches rebased work.
+            return await searchCommits(field, today);
         } catch (err) {
             console.error(`⚠️ Commit search failed for ${field}:`, err.message);
+            return [];
+        }
+    });
+
+    // Repo discovery and the commit search do not depend on each other.
+    const [searchResults, activeRepos, eventRepos] = await Promise.all([
+        runPooled(searchTasks, CONCURRENCY),
+        fetchActiveRepos(since),
+        fetchReposFromEvents(since)
+    ]);
+
+    for (const items of searchResults) {
+        for (const c of items) {
+            const repo = c.repository?.full_name;
+            if (repo) repos.add(repo);
+            add(c.sha, repo, c.commit?.message);
         }
     }
 
-    // Widen the repo list: everything pushed today, by any affiliation, plus
-    // the events feed as a backstop.
-    for (const r of await fetchActiveRepos(since)) repos.add(r);
-    for (const r of await fetchReposFromEvents(since)) repos.add(r);
+    for (const r of activeRepos) repos.add(r);
+    for (const r of eventRepos) repos.add(r);
 
     // Walk every branch of every active repo. This is what picks up work on
     // feature branches, which commit search never returns.
-    for (const repo of repos) {
-        let branches;
-
+    const headLists = await runPooled([...repos].map(repo => async () => {
         try {
-            branches = await fetchBranches(repo);
+            return { repo, heads: await fetchBranchHeads(repo) };
         } catch (err) {
             console.error(`⚠️ Failed to fetch branches for ${repo}:`, err.message);
-            continue;
+            return { repo, heads: new Map() };
         }
+    }), CONCURRENCY);
 
-        for (const branch of branches) {
-            try {
-                const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}&per_page=100`;
-                const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
+    const commitTasks = [];
 
-                for (const c of (commitsRes.data || [])) {
-                    add(c.sha, repo, c.commit?.message);
+    for (const { repo, heads } of headLists) {
+        for (const [sha, branch] of heads) {
+            commitTasks.push(async () => {
+                try {
+                    const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${sha}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}&per_page=100`;
+                    const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
+                    return { repo, commits: commitsRes.data || [] };
+                } catch (err) {
+                    // 409 = empty repo, not worth reporting
+                    if (err.response?.status !== 409) {
+                        console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
+                    }
+                    return { repo, commits: [] };
                 }
-            } catch (err) {
-                // 409 = empty repo, not worth reporting
-                if (err.response?.status === 409) continue;
-                console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
-            }
+            });
         }
+    }
+
+    for (const { repo, commits: branchCommits } of await runPooled(commitTasks, CONCURRENCY)) {
+        for (const c of branchCommits) add(c.sha, repo, c.commit?.message);
     }
 
     return commits;
