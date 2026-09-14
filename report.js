@@ -14,6 +14,11 @@ const REASONING_EFFORT = process.env.GROQ_REASONING_EFFORT;
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
+const GH_HEADERS = {
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    Accept: "application/vnd.github+json"
+};
+
 const GROQ_TIMEOUT = 180000; // 3 min, stays under cron.ps1's 300s process kill
 const MAX_LLM_RETRIES = 3;
 const MAX_COMPLETION_TOKENS = 8192;
@@ -32,69 +37,118 @@ function getDateString() {
     return new Date().toISOString().split("T")[0];
 }
 
+// Local calendar date. getDateString() is UTC, so at UTC+6 it still returns
+// yesterday until 06:00 local - wrong day for GitHub's date qualifiers.
+function getLocalDateString() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 /* ---------------------------
    GITHUB: GLOBAL COMMITS
 ----------------------------*/
 
+// GitHub's commit search, paginated. Covers every repo the token can see,
+// so repos are not discovered through the events feed.
+async function searchCommits(dateField, date) {
+    const q = `author:${GITHUB_USERNAME} ${dateField}:${date}`;
+    const items = [];
+
+    for (let page = 1; page <= 3; page++) {
+        const url = `https://api.github.com/search/commits?q=${encodeURIComponent(q)}&per_page=100&page=${page}`;
+        const res = await axios.get(url, { headers: GH_HEADERS });
+        const pageItems = res.data?.items || [];
+        items.push(...pageItems);
+        if (pageItems.length < 100) break;
+    }
+
+    return items;
+}
+
+// Fallback discovery: branches pushed today, from the events feed.
+// Catches commits whose author date is older than today but were pushed today.
+async function fetchPushedBranches(since) {
+    const pushedBranches = new Map(); // key: "repo:branch", value: { repo, branch }
+
+    // The events feed is capped at 300 and is NOT sorted by date, so all
+    // three pages must be read or today's pushes can be missed.
+    for (let page = 1; page <= 3; page++) {
+        const url = `https://api.github.com/users/${GITHUB_USERNAME}/events?per_page=100&page=${page}`;
+        let events;
+
+        try {
+            const res = await axios.get(url, { headers: GH_HEADERS });
+            events = res.data || [];
+        } catch (err) {
+            console.error(`⚠️ Failed to fetch events page ${page}:`, err.message);
+            break;
+        }
+
+        for (const event of events) {
+            if (event.type !== "PushEvent") continue;
+            if (new Date(event.created_at) < new Date(since)) continue;
+
+            const repo = event.repo?.name;
+            const ref = event.payload?.ref;
+
+            if (repo && ref && ref.startsWith("refs/heads/")) {
+                const branch = ref.replace("refs/heads/", "");
+                pushedBranches.set(`${repo}:${branch}`, { repo, branch });
+            }
+        }
+
+        if (events.length < 100) break;
+    }
+
+    return pushedBranches;
+}
+
 async function fetchCommits() {
     const since = getStartOfDayISO();
-
-    const url = `https://api.github.com/users/${GITHUB_USERNAME}/events?per_page=100`;
-
-    const res = await axios.get(url, {
-        headers: {
-            Authorization: `Bearer ${GITHUB_TOKEN}`,
-            Accept: "application/vnd.github+json"
-        }
-    });
-
-    const events = res.data || [];
-
-    // Find all unique repo and branch pairs pushed today
-    const pushedBranches = new Map(); // key: "repo/branch", value: { repo, branch }
-
-    for (const event of events) {
-        if (event.type !== "PushEvent") continue;
-        if (new Date(event.created_at) < new Date(since)) continue;
-
-        const repo = event.repo?.name;
-        const ref = event.payload?.ref;
-
-        if (repo && ref && ref.startsWith("refs/heads/")) {
-            const branch = ref.replace("refs/heads/", "");
-            const key = `${repo}:${branch}`;
-            pushedBranches.set(key, { repo, branch });
-        }
-    }
+    const today = getLocalDateString();
 
     const commits = [];
     const seenShas = new Set();
 
-    // Fetch commits for each pushed branch since today
+    const add = (sha, repo, message) => {
+        if (!sha || seenShas.has(sha)) return;
+        seenShas.add(sha);
+        commits.push({
+            sha,
+            repository: {
+                full_name: repo
+            },
+            commit: {
+                message: message || ""
+            }
+        });
+    };
+
+    // Primary source: commit search on both author date and committer date.
+    // committer-date catches rebased or cherry-picked work.
+    for (const field of ["author-date", "committer-date"]) {
+        try {
+            const items = await searchCommits(field, today);
+            for (const c of items) {
+                add(c.sha, c.repository?.full_name, c.commit?.message);
+            }
+        } catch (err) {
+            console.error(`⚠️ Commit search failed for ${field}:`, err.message);
+        }
+    }
+
+    // Fallback: walk branches pushed today. The events feed lags and sometimes
+    // drops private-repo pushes, so it only supplements the search above.
+    const pushedBranches = await fetchPushedBranches(since);
+
     for (const { repo, branch } of pushedBranches.values()) {
         try {
             const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}`;
-            const commitsRes = await axios.get(commitsUrl, {
-                headers: {
-                    Authorization: `Bearer ${GITHUB_TOKEN}`,
-                    Accept: "application/vnd.github+json"
-                }
-            });
+            const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
 
-            const branchCommits = commitsRes.data || [];
-            for (const c of branchCommits) {
-                if (c.sha && !seenShas.has(c.sha)) {
-                    seenShas.add(c.sha);
-                    commits.push({
-                        sha: c.sha,
-                        repository: {
-                            full_name: repo
-                        },
-                        commit: {
-                            message: c.commit?.message || ""
-                        }
-                    });
-                }
+            for (const c of (commitsRes.data || [])) {
+                add(c.sha, repo, c.commit?.message);
             }
         } catch (err) {
             console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
@@ -109,19 +163,14 @@ async function fetchCommits() {
 ----------------------------*/
 
 async function fetchPRs() {
-    const since = getDateString();
+    const since = getLocalDateString();
 
     const query = `author:${GITHUB_USERNAME} type:pr created:${since}`;
 
     const url =
         `https://api.github.com/search/issues?q=${encodeURIComponent(query)}`;
 
-    const res = await axios.get(url, {
-        headers: {
-            Authorization: `Bearer ${GITHUB_TOKEN}`,
-            Accept: "application/vnd.github+json"
-        }
-    });
+    const res = await axios.get(url, { headers: GH_HEADERS });
 
     const items = res.data.items || [];
 
@@ -133,12 +182,7 @@ async function fetchPRs() {
 
         try {
             const commitsUrl = `https://api.github.com/repos/${repoFull}/pulls/${item.number}/commits`;
-            const commitsRes = await axios.get(commitsUrl, {
-                headers: {
-                    Authorization: `Bearer ${GITHUB_TOKEN}`,
-                    Accept: "application/vnd.github+json"
-                }
-            });
+            const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
             item.pr_commits = (commitsRes.data || []).map(c => ({
                 sha: c.sha,
                 message: c.commit?.message || ""
@@ -399,7 +443,10 @@ OUTPUT FORMAT:
 
 # Today's Work
 ---------------
+
+
 ## Repository Name
+
 - System-level deliverable
 - System-level deliverable
 
