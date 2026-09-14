@@ -23,8 +23,9 @@ const GROQ_TIMEOUT = 180000; // 3 min, stays under cron.ps1's 300s process kill
 const MAX_LLM_RETRIES = 3;
 const MAX_COMPLETION_TOKENS = 8192;
 
-const MAX_REPO_PAGES = 5;
+const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
+const MAX_BULLETS_PER_REPO = 6;
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
 /* ---------------------------
@@ -346,6 +347,15 @@ function groupData(commits, prs) {
 /* ---------------------------
    HELPER: SIMPLIFY FOR AI
 ----------------------------*/
+// How many bullets a repo is allowed, derived from real commit volume.
+// A repo with one commit must not produce a dozen deliverables - that is what
+// made earlier reports read as padded.
+function bulletBudget(commitCount) {
+    if (commitCount <= 2) return 2;
+    if (commitCount <= 6) return 3;
+    return MAX_BULLETS_PER_REPO;
+}
+
 function simplify(data) {
     const result = {};
 
@@ -360,7 +370,14 @@ function simplify(data) {
             cleaned.push(cleanMessage(msg, repo));
         }
 
-        result[repo] = cleaned;
+        // Repos whose commits were all noise carry no signal worth a section.
+        if (!cleaned.length) continue;
+
+        result[repo] = {
+            commit_count: cleaned.length,
+            max_bullets: bulletBudget(cleaned.length),
+            commits: cleaned
+        };
     }
 
     return result;
@@ -379,12 +396,59 @@ function isNoise(msg) {
 
     const m = msg.toLowerCase().trim();
 
+    if (m.length < 8) return true;
+
+    // Merge commits describe branch plumbing, not delivered work.
+    if (m.startsWith("merge branch") || m.startsWith("merge pull request") || m.startsWith("merge remote")) return true;
+
     return (
         m === "debug" ||
         m === "done" ||
-        m.startsWith("merge branch") ||
-        m.length < 5
+        m === "wip" ||
+        m.startsWith("wip:") ||
+        m.startsWith("wip ") ||
+        m === "update readme" ||
+        m === "initial commit" ||
+        /^(fix|test|update|chore|cleanup|minor fix)(\.|!)?$/.test(m)
     );
+}
+
+// The model treats bullet limits as suggestions. This does not.
+// Trims each "## repo" section to that repo's budget and reports when it fires.
+function enforceBulletLimits(markdown, simplified) {
+    const lines = markdown.split("\n");
+    const out = [];
+
+    let budget = Infinity;
+    let used = 0;
+    let trimmed = 0;
+
+    for (const line of lines) {
+        const heading = line.match(/^##\s+(.+?)\s*$/);
+
+        if (heading) {
+            budget = simplified[heading[1]]?.max_bullets ?? Infinity;
+            used = 0;
+            out.push(line);
+            continue;
+        }
+
+        if (/^\s*[-*]\s+/.test(line)) {
+            if (used >= budget) {
+                trimmed++;
+                continue;
+            }
+            used++;
+        }
+
+        out.push(line);
+    }
+
+    if (trimmed) {
+        console.warn(`⚠️  Trimmed ${trimmed} over-budget bullet(s) - the model ignored max_bullets.`);
+    }
+
+    return out.join("\n");
 }
 
 
@@ -433,7 +497,7 @@ async function requestCompletion(prompt) {
                 content: prompt,
             },
         ],
-        temperature: 0.6,
+        temperature: 0.3,
         top_p: 0.95,
         max_completion_tokens: MAX_COMPLETION_TOKENS,
         ...(REASONING_EFFORT ? { reasoning_effort: REASONING_EFFORT } : {}),
@@ -484,85 +548,73 @@ async function requestCompletion(prompt) {
  ----------------------------*/
 
 async function generateReport(data) {
-    const prompt = `You are a senior engineering manager writing a daily engineering progress report.
+    const simplified = simplify(data);
 
-You will receive commit messages grouped by repository.
+    const prompt = `You are writing a short daily work summary for a CEO who is not technical.
+
+You receive commit messages grouped by repository. Each repository carries a commit_count
+and a max_bullets budget.
 
 GOAL:
-Transform commit history into high-level engineering delivery summaries that reflect completed systems, features, and meaningful technical work.
+Say what got done today, in plain language, in as few bullets as possible.
 
-CORE RULE:
-Think in terms of “what was delivered to the system”, not “what was changed in code”.
+HARD RULES:
 
-RULES:
-
-Keep repository names and order unchanged.
-Do NOT output commit-level details.
-Merge all related commits into system-level or feature-level outcomes.
-Each bullet must represent a completed engineering deliverable (feature, module, subsystem, or significant enhancement).
-Use senior engineering language (system, lifecycle, workflow, architecture, capability, module).
-Avoid technical noise such as individual methods, files, or minor refactors.
-Group UI, backend, database, API, and tests under one coherent feature when related.
-Ignore trivial changes unless they contribute to a larger system change.
-No repetition of the same feature across bullets.
-
-TONE:
-
-Senior engineering manager level
-Concise, structured, and authoritative
-Focus on systems and capabilities, not implementation steps
-No commit-style wording (“added”, “fixed”, “refactored”) unless part of a broader system description
-
-QUANTITY:
-
-Minimum 12 bullets per repository when sufficient scope exists
-Maximum 22 bullets per repository
-If work is small, naturally consolidate into fewer but higher-level system descriptions
+Never write more bullets than that repository's max_bullets. Fewer is better.
+Every bullet must come from actual commits. Never invent work to fill space.
+Merge related commits into one bullet.
+Keep repository names and order exactly as given.
+Skip a repository entirely if its commits say nothing meaningful.
 
 WRITING STYLE:
 
-Each bullet should describe a delivered capability or subsystem
-8–16 words per bullet
-Prefer nouns over verbs (e.g., “activation management system”, not “added activation system”)
-Avoid explanations, benefits, or storytelling
+Start each bullet with a plain verb: Added, Improved, Updated, Fixed, Enhanced.
+5 to 10 words per bullet.
+Use concrete numbers and feature names when the commits contain them.
+Bold a feature name with ** only when it is a real named feature.
+No jargon: no lifecycle, subsystem, architecture, capability, module, layer.
+No benefit claims, no explanations, no filler.
 
-make this list more easy to read for fully non tech person, he is ceo
+GOOD (this is exactly the target):
 
-EXAMPLES:
+## acme/storefront
 
-BAD:
+* Added **Dead Stock** detection for products with no sales for 60+ days
+* Added inventory cost and dead stock reporting
+* Improved stock health dashboard and analysis
 
-Added activation page
-Fixed modal UI
-Updated validation logic
+## acme/bank-portal
 
-GOOD:
+* Added 36 business categories
+* Improved business account and onboarding forms
+* Updated KYC, validation, and business data handling
 
-Activation management system with lifecycle tracking and bulk operations
-Standardized administrative UI components across modal interfaces
-Enhanced license validation and rule enforcement layer
+BAD (padded, vague, and far too many bullets):
 
-make the daily work report a bit short and clear for a bit less not tech people
+* Enhanced visibility into engineering delivery
+* Streamlined administrative workflow for data ingestion
+* Improved data consistency across frontend and backend
+* Centralized enum management for business types
 
 OUTPUT FORMAT:
 
 # Today's Work
----------------
 
+---
 
 ## Repository Name
 
-- System-level deliverable
-- System-level deliverable
+* Bullet
+* Bullet
 
 INPUT:
-${JSON.stringify(data)}
+${JSON.stringify(simplified)}
 `;
     if (!GROQ_API_KEY) {
         throw new Error("GROQ_API_KEY is missing. Add it to .env (see .env.example).");
     }
 
-    console.log("🧠 Sending prompt to Groq...", prompt);
+    console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Groq...`);
 
     console.log(`⏳ Waiting for Groq response (${MODEL})...`);
 
@@ -581,7 +633,7 @@ ${JSON.stringify(data)}
         );
     }
 
-    return stripReasoning(choice.message.content);
+    return enforceBulletLimits(stripReasoning(choice.message.content), simplified);
 }
 
 /* ---------------------------
