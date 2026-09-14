@@ -25,6 +25,7 @@ const MAX_COMPLETION_TOKENS = 8192;
 
 const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
+const MIN_BULLETS_PER_REPO = 3;
 const MAX_BULLETS_PER_REPO = 6;
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
@@ -351,9 +352,9 @@ function groupData(commits, prs) {
 // A repo with one commit must not produce a dozen deliverables - that is what
 // made earlier reports read as padded.
 function bulletBudget(commitCount) {
-    if (commitCount <= 2) return 2;
-    if (commitCount <= 6) return 3;
-    return MAX_BULLETS_PER_REPO;
+    // Floor of 3: even a single commit usually covers a few distinct changes,
+    // and two bullets reads as if work was left out.
+    return Math.min(MAX_BULLETS_PER_REPO, Math.max(MIN_BULLETS_PER_REPO, Math.ceil(commitCount / 3)));
 }
 
 function simplify(data) {
@@ -556,11 +557,13 @@ You receive commit messages grouped by repository. Each repository carries a com
 and a max_bullets budget.
 
 GOAL:
-Say what got done today, in plain language, in as few bullets as possible.
+Say what got done today, in plain language, at the level of detail a CEO can skim.
 
 HARD RULES:
 
-Never write more bullets than that repository's max_bullets. Fewer is better.
+Write exactly max_bullets bullets per repository. That is the target, not a ceiling to stay under.
+Go below max_bullets only when the commits genuinely describe fewer separate changes.
+Never merge two unrelated changes into one bullet just to write fewer bullets.
 Every bullet must come from actual commits. Never invent work to fill space.
 Merge related commits into one bullet.
 Keep repository names and order exactly as given.
