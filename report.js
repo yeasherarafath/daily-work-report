@@ -779,7 +779,10 @@ HARD RULES:
 Write between min_bullets and max_bullets bullets per repository. max_bullets is the target, not a ceiling to stay under.
 Across all repositories the report must total at least ${totals.min} bullets, and ${totals.max} is the target. Count them before answering.
 Give every commit exactly the number of bullets its bullets field says. That number is not negotiable.
-For a commit with bullets of 2 or more, write one bullet per distinct area in its areas list. Never fold it into one bullet.
+For a commit with bullets of 2 or more, write one parent bullet naming the feature, then indented sub-bullets (two spaces, then "*") for its most important sub-parts, taken from its areas list. The parent counts as one of its bullets. Never fold it into one bullet.
+A parent bullet with sub-bullets gets at least 2 and at most 5 of them. Sub-bullets are never nested deeper than one level.
+Commits with bullets of 1 stay as a single flat bullet with no sub-bullets.
+Every bullet, parent or sub-bullet, counts toward min_bullets, max_bullets and the daily total.
 Commits with bullets of 1 may be merged with each other, and must never crowd out a bigger commit.
 Keep the repository's bullets in the order the commits are given: biggest work first.
 Never merge two unrelated changes into one bullet just to write fewer bullets.
@@ -791,7 +794,8 @@ Skip a repository entirely if its commits say nothing meaningful.
 
 WRITING STYLE:
 
-Start each bullet with a plain verb: Added, Improved, Updated, Fixed, Enhanced.
+Start each parent or flat bullet with a plain verb: Added, Improved, Updated, Fixed, Enhanced.
+Sub-bullets name the part directly, with no verb needed.
 5 to 10 words per bullet.
 Use concrete numbers and feature names when the commits contain them.
 Bold a feature name with ** only when it is a real named feature.
@@ -812,14 +816,14 @@ GOOD (this is exactly the target):
 * Improved business account and onboarding forms
 * Updated KYC, validation, and business data handling
 
-GOOD (one commit with bullets: 4, broken up by the areas it touched):
+GOOD (one commit with bullets: 4 - a parent bullet, then sub-bullets from the areas it touched):
 
 ## acme/field-ops
 
 * Added **Task Manager** for creating and assigning jobs to staff
-* Added task lists with filters, search, and paging
-* Added task notes and an activity history of who changed what
-* Added task reminders that respect each store's timezone
+  * Task lists with filters, search, and paging
+  * Task notes and activity history
+  * Task reminders that respect each store's timezone
 
 BAD (padded, vague, and far too many bullets):
 
@@ -836,8 +840,10 @@ OUTPUT FORMAT:
 
 ## Repository Name
 
-* Bullet
-* Bullet
+* Parent bullet
+  * Sub-bullet
+  * Sub-bullet
+* Flat bullet
 
 INPUT:
 ${JSON.stringify(simplified)}
