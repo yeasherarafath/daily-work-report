@@ -34,6 +34,8 @@ const BIG_CHANGE_LINES = 2000;   // above this a commit is worth 3 bullets
 const HUGE_CHANGE_LINES = 6000;  // above this a commit is worth 4
 const MAX_AREAS_PER_COMMIT = 5;  // area names sent per commit, to keep the prompt small
 const MAX_STAT_COMMITS = 150;    // ceiling on per-commit stat requests per run
+const MIN_TOTAL_BULLETS = 10;    // daily floor across all repos, when the material exists
+const TARGET_TOTAL_BULLETS = 12; // daily target across all repos
 
 // Generated and vendored files. A lockfile refresh outweighs a real feature if
 // these count toward a commit's size.
@@ -499,12 +501,40 @@ function bulletBudget(commits) {
     return { min: Math.min(max, Math.max(MIN_BULLETS_PER_REPO, big)), max };
 }
 
+// A quiet day spread over few repos can land under the daily floor. Raises
+// budgets until the day totals MIN_TOTAL_BULLETS..TARGET_TOTAL_BULLETS, but only
+// into repos with real material left (distinct commits and areas) - never pads.
+function balanceTotals(result, capacity) {
+    const repos = Object.keys(result);
+    const sum = key => repos.reduce((n, r) => n + result[r][key], 0);
+
+    const pick = (room) => repos
+        .filter(r => room(r) > 0)
+        .sort((a, b) => room(b) - room(a))[0];
+
+    while (sum("max_bullets") < TARGET_TOTAL_BULLETS) {
+        const repo = pick(r => Math.min(capacity[r], Math.max(MAX_BULLETS_PER_REPO, TARGET_TOTAL_BULLETS)) - result[r].max_bullets);
+        if (!repo) break;
+        result[repo].max_bullets++;
+    }
+
+    while (sum("min_bullets") < MIN_TOTAL_BULLETS) {
+        const repo = pick(r => result[r].max_bullets - result[r].min_bullets);
+        if (!repo) break;
+        result[repo].min_bullets++;
+    }
+
+    return { min: sum("min_bullets"), max: sum("max_bullets") };
+}
+
 function simplify(data) {
     const result = {};
+    const capacity = {};
 
     for (const repo in data) {
         const cleaned = [];
         let totalLines = 0;
+        let repoCapacity = 0;
 
         for (const c of data[repo].commits || []) {
             const msg = c?.msg || c?.message || "";
@@ -522,6 +552,7 @@ function simplify(data) {
             if (c.areas?.length) entry.areas = c.areas;
 
             entry.bullets = commitBullets(c.lines);
+            repoCapacity += Math.max(1, c.areas?.length || 0);
 
             cleaned.push(entry);
         }
@@ -542,9 +573,12 @@ function simplify(data) {
             max_bullets: budget.max,
             commits: cleaned
         };
+        capacity[repo] = repoCapacity;
     }
 
-    return result;
+    const totals = balanceTotals(result, capacity);
+
+    return { result, totals };
 }
 
 function cleanMessage(msg, repo) {
@@ -728,7 +762,7 @@ async function requestCompletion(prompt) {
  ----------------------------*/
 
 async function generateReport(data) {
-    const simplified = simplify(data);
+    const { result: simplified, totals } = simplify(data);
 
     const prompt = `You are writing a short daily work summary for a CEO who is not technical.
 
@@ -743,6 +777,7 @@ Say what got done today, in plain language, at the level of detail a CEO can ski
 HARD RULES:
 
 Write between min_bullets and max_bullets bullets per repository. max_bullets is the target, not a ceiling to stay under.
+Across all repositories the report must total at least ${totals.min} bullets, and ${totals.max} is the target. Count them before answering.
 Give every commit exactly the number of bullets its bullets field says. That number is not negotiable.
 For a commit with bullets of 2 or more, write one bullet per distinct area in its areas list. Never fold it into one bullet.
 Commits with bullets of 1 may be merged with each other, and must never crowd out a bigger commit.
@@ -816,6 +851,7 @@ ${JSON.stringify(simplified)}
         console.log(`   ${repo} - ${s.commit_count} commit(s), ${s.total_lines} line(s), ${s.max_bullets} bullet(s)`);
     }
 
+    console.log(`🎯 Bullet budget: ${totals.min}-${totals.max} total`);
     console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Groq...`);
 
     console.log(`⏳ Waiting for Groq response (${MODEL})...`);
