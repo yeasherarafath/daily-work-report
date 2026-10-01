@@ -25,8 +25,8 @@ const MAX_COMPLETION_TOKENS = 8192;
 
 const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
-const MIN_BULLETS_PER_REPO = 3;
-const MAX_BULLETS_PER_REPO = 10;
+const MIN_BULLETS_PER_REPO = 12; // per repository, when its commits hold the material
+const MAX_BULLETS_PER_REPO = 17; // per repository
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
 const SMALL_COMMIT_LINES = 1000; // below this a commit shares a bullet with its neighbours
@@ -34,8 +34,6 @@ const BIG_CHANGE_LINES = 2000;   // above this a commit is worth 3 bullets
 const HUGE_CHANGE_LINES = 6000;  // above this a commit is worth 4
 const MAX_AREAS_PER_COMMIT = 5;  // area names sent per commit, to keep the prompt small
 const MAX_STAT_COMMITS = 150;    // ceiling on per-commit stat requests per run
-const MIN_TOTAL_BULLETS = 10;    // daily floor across all repos, when the material exists
-const TARGET_TOTAL_BULLETS = 12; // daily target across all repos
 
 // Generated and vendored files. A lockfile refresh outweighs a real feature if
 // these count toward a commit's size.
@@ -480,56 +478,20 @@ function commitBullets(lines) {
     return 1;
 }
 
-// A repository's floor and ceiling, summed from what its commits are worth.
-// The floor covers the big commits only, so a large module cannot be written
-// off in one line; small commits share bullets three to one.
-function bulletBudget(commits) {
-    let big = 0;
-    let small = 0;
+// A repository's budget is MIN_BULLETS_PER_REPO..MAX_BULLETS_PER_REPO, but only
+// as far as real material goes (distinct commits and areas) - never pads. A repo
+// with little work gets a smaller budget instead of invented bullets.
+function bulletBudget(capacity) {
+    const room = Math.max(3, capacity);
 
-    for (const c of commits) {
-        if (typeof c.lines === "number" && c.lines >= SMALL_COMMIT_LINES) big += commitBullets(c.lines);
-        else small++;
-    }
-
-    const target = big + Math.ceil(small / 3);
-
-    // Floor of 3: even a single commit usually covers a few distinct changes,
-    // and two bullets reads as if work was left out.
-    const max = Math.min(MAX_BULLETS_PER_REPO, Math.max(MIN_BULLETS_PER_REPO, target));
-
-    return { min: Math.min(max, Math.max(MIN_BULLETS_PER_REPO, big)), max };
-}
-
-// A quiet day spread over few repos can land under the daily floor. Raises
-// budgets until the day totals MIN_TOTAL_BULLETS..TARGET_TOTAL_BULLETS, but only
-// into repos with real material left (distinct commits and areas) - never pads.
-function balanceTotals(result, capacity) {
-    const repos = Object.keys(result);
-    const sum = key => repos.reduce((n, r) => n + result[r][key], 0);
-
-    const pick = (room) => repos
-        .filter(r => room(r) > 0)
-        .sort((a, b) => room(b) - room(a))[0];
-
-    while (sum("max_bullets") < TARGET_TOTAL_BULLETS) {
-        const repo = pick(r => Math.min(capacity[r], Math.max(MAX_BULLETS_PER_REPO, TARGET_TOTAL_BULLETS)) - result[r].max_bullets);
-        if (!repo) break;
-        result[repo].max_bullets++;
-    }
-
-    while (sum("min_bullets") < MIN_TOTAL_BULLETS) {
-        const repo = pick(r => result[r].max_bullets - result[r].min_bullets);
-        if (!repo) break;
-        result[repo].min_bullets++;
-    }
-
-    return { min: sum("min_bullets"), max: sum("max_bullets") };
+    return {
+        min: Math.min(MIN_BULLETS_PER_REPO, room),
+        max: Math.min(MAX_BULLETS_PER_REPO, room)
+    };
 }
 
 function simplify(data) {
     const result = {};
-    const capacity = {};
 
     for (const repo in data) {
         const cleaned = [];
@@ -564,7 +526,7 @@ function simplify(data) {
         // limit trims from the end, so a large module must not sit last.
         cleaned.sort((a, b) => (b.lines || 0) - (a.lines || 0));
 
-        const budget = bulletBudget(cleaned);
+        const budget = bulletBudget(repoCapacity);
 
         result[repo] = {
             commit_count: cleaned.length,
@@ -573,12 +535,9 @@ function simplify(data) {
             max_bullets: budget.max,
             commits: cleaned
         };
-        capacity[repo] = repoCapacity;
     }
 
-    const totals = balanceTotals(result, capacity);
-
-    return { result, totals };
+    return { result };
 }
 
 function cleanMessage(msg, repo) {
@@ -762,7 +721,7 @@ async function requestCompletion(prompt) {
  ----------------------------*/
 
 async function generateReport(data) {
-    const { result: simplified, totals } = simplify(data);
+    const { result: simplified } = simplify(data);
 
     const prompt = `You are writing a short daily work summary for a CEO who is not technical.
 
@@ -776,13 +735,12 @@ Say what got done today, in plain language, at the level of detail a CEO can ski
 
 HARD RULES:
 
-Write between min_bullets and max_bullets bullets per repository. max_bullets is the target, not a ceiling to stay under.
-Across all repositories the report must total at least ${totals.min} bullets, and ${totals.max} is the target. Count them before answering.
+Write between min_bullets and max_bullets bullets for each repository. Each repository has its own budget; do not share bullets between repositories. max_bullets is the target, not a ceiling to stay under. Count each repository's bullets before answering.
 Give every commit exactly the number of bullets its bullets field says. That number is not negotiable.
 For a commit with bullets of 2 or more, write one main bullet naming the feature, then more bullets of the same kind, placed directly after it, for its most important sub-parts taken from its areas list. Never fold it into one bullet.
 All bullets are flat: same "*" marker, same indent level, no nesting, no indentation. Keep a commit's bullets together, main bullet first.
 Commits with bullets of 1 stay a single bullet.
-Every bullet counts toward min_bullets, max_bullets and the daily total.
+Every bullet counts toward its repository's min_bullets and max_bullets.
 Commits with bullets of 1 may be merged with each other, and must never crowd out a bigger commit.
 Keep the repository's bullets in the order the commits are given: biggest work first.
 Never merge two unrelated changes into one bullet just to write fewer bullets.
@@ -801,7 +759,7 @@ Bold a feature name with ** only when it is a real named feature.
 No jargon: no lifecycle, subsystem, architecture, capability, module, layer.
 No benefit claims, no explanations, no filler.
 
-GOOD (this is exactly the target):
+GOOD (style and format only; real repositories get min_bullets to max_bullets bullets, so write more than these short examples show):
 
 ## acme/storefront
 
@@ -853,10 +811,9 @@ ${JSON.stringify(simplified)}
 
     for (const repo in simplified) {
         const s = simplified[repo];
-        console.log(`   ${repo} - ${s.commit_count} commit(s), ${s.total_lines} line(s), ${s.max_bullets} bullet(s)`);
+        console.log(`   ${repo} - ${s.commit_count} commit(s), ${s.total_lines} line(s), ${s.min_bullets}-${s.max_bullets} bullet(s)`);
     }
 
-    console.log(`🎯 Bullet budget: ${totals.min}-${totals.max} total`);
     console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Groq...`);
 
     console.log(`⏳ Waiting for Groq response (${MODEL})...`);
