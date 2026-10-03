@@ -481,13 +481,14 @@ function commitBullets(lines) {
 // A repository's budget is MIN_BULLETS_PER_REPO..MAX_BULLETS_PER_REPO, but only
 // as far as real material goes (distinct commits and areas) - never pads. A repo
 // with little work gets a smaller budget instead of invented bullets.
-function bulletBudget(capacity) {
-    const room = Math.max(3, capacity);
+// Scaled by worth (sum of commitBullets), so a repo with one small task is not
+// forced to many bullets: worth 3 -> 1-2, worth 8 -> 4-5, worth 30 -> 6-17.
+function bulletBudget(capacity, worth) {
+    const room = Math.max(1, capacity);
+    const min = Math.min(MIN_BULLETS_PER_REPO, room, Math.max(1, Math.floor(worth / 2)));
+    const max = Math.min(MAX_BULLETS_PER_REPO, room, Math.max(min + 1, Math.ceil(worth * 0.6)));
 
-    return {
-        min: Math.min(MIN_BULLETS_PER_REPO, room),
-        max: Math.min(MAX_BULLETS_PER_REPO, room)
-    };
+    return { min, max: Math.max(min, max) };
 }
 
 function simplify(data) {
@@ -497,6 +498,7 @@ function simplify(data) {
         const cleaned = [];
         let totalLines = 0;
         let repoCapacity = 0;
+        let repoWorth = 0;
 
         for (const c of data[repo].commits || []) {
             const msg = c?.msg || c?.message || "";
@@ -514,6 +516,7 @@ function simplify(data) {
             if (c.areas?.length) entry.areas = c.areas;
 
             entry.bullets = commitBullets(c.lines);
+            repoWorth += entry.bullets;
             repoCapacity += Math.max(1, c.areas?.length || 0);
 
             cleaned.push(entry);
@@ -526,7 +529,7 @@ function simplify(data) {
         // limit trims from the end, so a large module must not sit last.
         cleaned.sort((a, b) => (b.lines || 0) - (a.lines || 0));
 
-        const budget = bulletBudget(repoCapacity);
+        const budget = bulletBudget(repoCapacity, repoWorth);
 
         result[repo] = {
             commit_count: cleaned.length,
@@ -735,7 +738,7 @@ Say what got done today, in plain language, at the level of detail a CEO can ski
 
 HARD RULES:
 
-Write between min_bullets and max_bullets bullets for each repository. Each repository has its own budget; do not share bullets between repositories. max_bullets is the target, not a ceiling to stay under. Count each repository's bullets before answering.
+Write between min_bullets and max_bullets bullets for each repository. Each repository has its own budget; do not share bullets between repositories. Fewer bullets is fine when the commits hold little; never stretch one small task into several bullets to reach max_bullets. Count each repository's bullets before answering.
 Give every commit exactly the number of bullets its bullets field says. That number is not negotiable.
 For a commit with bullets of 2 or more, write one main bullet naming the feature, then more bullets of the same kind, placed directly after it, for its most important sub-parts taken from its areas list. Never fold it into one bullet.
 All bullets are flat: same "*" marker, same indent level, no nesting, no indentation. Keep a commit's bullets together, main bullet first.
