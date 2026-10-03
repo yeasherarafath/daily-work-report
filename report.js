@@ -25,7 +25,7 @@ const MAX_COMPLETION_TOKENS = 8192;
 
 const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
-const MIN_BULLETS_PER_REPO = 12; // per repository, when its commits hold the material
+const MIN_BULLETS_PER_REPO = 6; // per repository, when its commits hold the material
 const MAX_BULLETS_PER_REPO = 17; // per repository
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
