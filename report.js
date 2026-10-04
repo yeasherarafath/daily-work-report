@@ -29,10 +29,11 @@ const MIN_BULLETS_PER_REPO = 6; // per repository, when its commits hold the mat
 const MAX_BULLETS_PER_REPO = 17; // per repository
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
-const SMALL_COMMIT_LINES = 1000; // below this a commit shares a bullet with its neighbours
+const SMALL_COMMIT_LINES = 600; // below this a commit shares a bullet with its neighbours
 const BIG_CHANGE_LINES = 2000;   // above this a commit is worth 3 bullets
 const HUGE_CHANGE_LINES = 6000;  // above this a commit is worth 4
-const MAX_AREAS_PER_COMMIT = 5;  // area names sent per commit, to keep the prompt small
+const BROAD_COMMIT_AREAS = 6;    // a commit touching this many feature areas is worth more bullets
+const MAX_AREAS_PER_COMMIT = 5; // area names sent per commit, to keep the prompt small
 const MAX_STAT_COMMITS = 150;    // ceiling on per-commit stat requests per run
 
 // Generated and vendored files. A lockfile refresh outweighs a real feature if
@@ -396,6 +397,7 @@ function pathArea(filename) {
 function summarizeFiles(data) {
     const files = data.files || [];
     const byArea = new Map();
+    const featureAreas = new Set();
     let lines = 0;
 
     for (const f of files) {
@@ -408,6 +410,9 @@ function summarizeFiles(data) {
 
         lines += changes;
         byArea.set(area, (byArea.get(area) || 0) + changes);
+
+        // Tests, docs, routes and migrations follow a feature; they are not one.
+        if (!/(^|\/)(tests?|postman|docs?|database|routes|config)(\/|$)/i.test(f.filename)) featureAreas.add(area);
     }
 
     // GitHub truncates the file list above 300 files; stats still cover the
@@ -421,7 +426,7 @@ function summarizeFiles(data) {
         .slice(0, MAX_AREAS_PER_COMMIT)
         .map(([area]) => area);
 
-    return { lines, areas };
+    return { lines, areas, breadth: featureAreas.size };
 }
 
 // Attaches diff size to every commit worth reporting. Noise is dropped first,
@@ -453,9 +458,10 @@ async function enrichWithStats(grouped) {
         const data = await fetchCommitStats(repo, commit.sha);
         if (!data) return;
 
-        const { lines, areas } = summarizeFiles(data);
+        const { lines, areas, breadth } = summarizeFiles(data);
         commit.lines = lines;
         commit.areas = areas;
+        commit.breadth = breadth;
     }), CONCURRENCY);
 
     return grouped;
@@ -470,12 +476,16 @@ async function enrichWithStats(grouped) {
 // What one commit is worth, from its diff size. A 10k-line module is not one
 // bullet's worth of work, and a typo fix is not three.
 // Unknown size (stats request failed, or over MAX_STAT_COMMITS) counts as small.
-function commitBullets(lines) {
+function commitBullets(lines, breadth) {
     if (typeof lines !== "number") return 1;
-    if (lines >= HUGE_CHANGE_LINES) return 4;
-    if (lines >= BIG_CHANGE_LINES) return 3;
-    if (lines >= SMALL_COMMIT_LINES) return 2;
-    return 1;
+    let n = 1;
+    if (lines >= HUGE_CHANGE_LINES) n = 4;
+    else if (lines >= BIG_CHANGE_LINES) n = 3;
+    else if (lines >= SMALL_COMMIT_LINES) n = 2;
+
+    // A commit spread over many features is several deliverables whatever its size.
+    if (breadth >= BROAD_COMMIT_AREAS) n = Math.max(n, 2) + (breadth >= BROAD_COMMIT_AREAS * 2 ? 1 : 0);
+    return n;
 }
 
 // A repository's budget is MIN_BULLETS_PER_REPO..MAX_BULLETS_PER_REPO, but only
@@ -515,7 +525,7 @@ function simplify(data) {
 
             if (c.areas?.length) entry.areas = c.areas;
 
-            entry.bullets = commitBullets(c.lines);
+            entry.bullets = commitBullets(c.lines, c.breadth);
             repoWorth += entry.bullets;
             repoCapacity += Math.max(1, c.areas?.length || 0);
 
