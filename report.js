@@ -531,6 +531,22 @@ function simplify(data) {
 
         const budget = bulletBudget(repoCapacity, repoWorth);
 
+        // Big commits must not eat the budget small, distinct commits need. Each
+        // small commit keeps a slot; big commits share what is left.
+        const smallCount = cleaned.filter(c => c.bullets === 1).length;
+        let spare = budget.max - smallCount;
+        const bigOnes = cleaned.filter(c => c.bullets > 1);
+
+        while (bigOnes.reduce((n, c) => n + c.bullets, 0) > Math.max(spare, bigOnes.length)) {
+            const widest = bigOnes.reduce((a, b) => (b.bullets > a.bullets ? b : a));
+            if (widest.bullets <= 1) break;
+            widest.bullets--;
+        }
+
+        const reserved = cleaned.reduce((n, c) => n + c.bullets, 0);
+        budget.max = Math.min(MAX_BULLETS_PER_REPO, Math.max(budget.max, Math.min(reserved, MAX_BULLETS_PER_REPO)));
+        budget.min = Math.min(budget.min, budget.max);
+
         result[repo] = {
             commit_count: cleaned.length,
             total_lines: totalLines,
@@ -545,7 +561,9 @@ function simplify(data) {
 
 function cleanMessage(msg, repo) {
     return msg
-        .replace(/feat\(|fix\(|refactor\(|docs\(|test\(/gi, '')
+        // "fix(validation): x" -> "validation: x". Dropping only "fix(" left a dangling ")".
+        .replace(/^(feat|fix|refactor|docs|test|chore|perf|style)\(([^)]*)\)!?:\s*/i, '$2: ')
+        .replace(/^(feat|fix|refactor|docs|test|chore|perf|style)!?:\s*/i, '')
         .replace(/merge branch.*$/gi, '')
         .replace(/\s+/g, ' ')
         .trim();
@@ -744,7 +762,8 @@ For a commit with bullets of 2 or more, write one main bullet naming the feature
 All bullets are flat: same "*" marker, same indent level, no nesting, no indentation. Keep a commit's bullets together, main bullet first.
 Commits with bullets of 1 stay a single bullet.
 Every bullet counts toward its repository's min_bullets and max_bullets.
-Commits with bullets of 1 may be merged with each other, and must never crowd out a bigger commit.
+Commits with bullets of 1 may be merged only when they are the same kind of change. A small commit about a different feature, screen, rule, or setting gets its own bullet - a fix to validation, an error display, a default setting, or a form guide is real work and must appear, even next to a huge commit.
+Many large commits that repeat the same kind of work (for example, many documentation or collection files) are one theme: cover that theme with its bullets, and spend the remaining bullets on the unrelated commits. Never let one theme fill the whole section.
 Keep the repository's bullets in the order the commits are given: biggest work first.
 Never merge two unrelated changes into one bullet just to write fewer bullets.
 Every bullet must come from actual commits. Never invent work to fill space.
