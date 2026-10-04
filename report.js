@@ -534,7 +534,9 @@ function simplify(data) {
         // Big commits must not eat the budget small, distinct commits need. Each
         // small commit keeps a slot; big commits share what is left.
         const smallCount = cleaned.filter(c => c.bullets === 1).length;
-        let spare = budget.max - smallCount;
+        // Shrink big commits only against the hard per-repo ceiling, not the
+        // worth-scaled max - that max was derived from these same commits.
+        const spare = MAX_BULLETS_PER_REPO - smallCount;
         const bigOnes = cleaned.filter(c => c.bullets > 1);
 
         while (bigOnes.reduce((n, c) => n + c.bullets, 0) > Math.max(spare, bigOnes.length)) {
@@ -545,7 +547,10 @@ function simplify(data) {
 
         const reserved = cleaned.reduce((n, c) => n + c.bullets, 0);
         budget.max = Math.min(MAX_BULLETS_PER_REPO, Math.max(budget.max, Math.min(reserved, MAX_BULLETS_PER_REPO)));
-        budget.min = Math.min(budget.min, budget.max);
+        // Every bullet a big commit is owed counts toward the floor, so the
+        // model cannot collapse a big module into one line.
+        const bigOwed = bigOnes.reduce((n, c) => n + c.bullets, 0);
+        budget.min = Math.min(Math.max(budget.min, bigOwed + Math.min(smallCount, 1)), budget.max);
 
         result[repo] = {
             commit_count: cleaned.length,
