@@ -12,7 +12,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const REASONING_EFFORT = process.env.GROQ_REASONING_EFFORT;
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_URL = "https://newisty.com/api/ai/v1/chat/completions";
 
 const GH_HEADERS = {
     Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -693,7 +693,7 @@ function sleep(ms) {
 }
 
 /**
- * POST the prompt to Groq, retrying transient failures with exponential
+ * POST the prompt to Newisty, retrying transient failures with exponential
  * backoff. Config errors (400/401/404) fail immediately instead of burning
  * three timeouts on a mistake that will not fix itself.
  */
@@ -731,7 +731,7 @@ async function requestCompletion(prompt) {
             const status = err.response && err.response.status;
 
             console.error(
-                `❌ Groq request failed (attempt ${attempt}/${MAX_LLM_RETRIES})` +
+                `❌ Newisty request failed (attempt ${attempt}/${MAX_LLM_RETRIES})` +
                 (status ? ` HTTP ${status}` : ` ${err.code || err.message}`)
             );
 
@@ -851,16 +851,16 @@ ${JSON.stringify(simplified)}
         console.log(`   ${repo} - ${s.commit_count} commit(s), ${s.total_lines} line(s), ${s.min_bullets}-${s.max_bullets} bullet(s)`);
     }
 
-    console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Groq...`);
+    console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Newisty...`);
 
-    console.log(`⏳ Waiting for Groq response (${MODEL})...`);
+    console.log(`⏳ Waiting for Newisty response (${MODEL})...`);
 
     const res = await requestCompletion(prompt);
 
     const choice = res.data && res.data.choices && res.data.choices[0];
 
     if (!choice || !choice.message || typeof choice.message.content !== "string") {
-        throw new Error(`Unexpected Groq response shape: ${JSON.stringify(res.data)}`);
+        throw new Error(`Unexpected Newisty response shape: ${JSON.stringify(res.data)}`);
     }
 
     if (choice.finish_reason === "length") {
