@@ -26,7 +26,7 @@ const MAX_COMPLETION_TOKENS = 8192;
 const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
 const MIN_BULLETS_PER_REPO = 6; // per repository, when its commits hold the material
-const MAX_BULLETS_PER_REPO = 23; // per repository
+const MAX_BULLETS_PER_REPO = 43; // per repository
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
 const SMALL_COMMIT_LINES = 600; // below this a commit shares a bullet with its neighbours
