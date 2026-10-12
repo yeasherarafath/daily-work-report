@@ -26,7 +26,7 @@ const MAX_COMPLETION_TOKENS = 8192;
 const MAX_REPO_PAGES = 6;
 const MAX_BRANCH_PAGES = 3;
 const MIN_BULLETS_PER_REPO = 6; // per repository, when its commits hold the material
-const MAX_BULLETS_PER_REPO = 17; // per repository
+const MAX_BULLETS_PER_REPO = 23; // per repository
 const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
 
 const SMALL_COMMIT_LINES = 600; // below this a commit shares a bullet with its neighbours
@@ -492,7 +492,7 @@ function commitBullets(lines, breadth) {
 // as far as real material goes (distinct commits and areas) - never pads. A repo
 // with little work gets a smaller budget instead of invented bullets.
 // Scaled by worth (sum of commitBullets), so a repo with one small task is not
-// forced to many bullets: worth 3 -> 1-2, worth 8 -> 4-5, worth 30 -> 6-17.
+// forced to many bullets: worth 3 -> 1-2, worth 8 -> 4-5, worth 34+ -> 6-20.
 function bulletBudget(capacity, worth) {
     const room = Math.max(1, capacity);
     const min = Math.min(MIN_BULLETS_PER_REPO, room, Math.max(1, Math.floor(worth / 2)));
