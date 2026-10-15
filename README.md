@@ -5,11 +5,11 @@ This branch's `report.js` reports on Figma design work instead of GitHub commits
 1. Lists files touched today (team folders from `FIGMA_TEAM_IDS` plus `FIGMA_FILE_KEYS`), keeping only files you edited.
 2. Lets you pick files from a numbered list (`0` = all). `--all` skips the picker; `--file <key|url>` reports one file. Non-interactive runs (cron) take all files.
 3. Diffs each file between the last version before today and now (pages, screens, components, text, placed components), adds today's named versions and comments.
-4. Sends the summary to the Newisty AI endpoint and writes `today-work.md` and `reports/YYYY-MM-DD.md`.
+4. Sends the summary to the Newisty AI endpoint and writes `today-figma.md` and `reports/figma-YYYY-MM-DD.md` (separate from the GitHub report files).
 
 Setup: add `FIGMA_TOKEN`, `FIGMA_TEAM_IDS` and/or `FIGMA_FILE_KEYS` to `.env` (see `.env.example`). The Figma API cannot list drafts, so add draft files to `FIGMA_FILE_KEYS`.
 
-Rate limits: full file fetches are Figma's Tier 1 endpoint (10-20/min on Full/Dev seats, 20/month on View/Collab). Past versions are cached in `.figma-cache/`. If the limit is hit, the report falls back to versions and comments.
+Rate limits: full file fetches are Figma's Tier 1 endpoint (10-20/min on Full/Dev seats, 20/month on View/Collab). Past versions and a per-day snapshot of each file are cached in `.figma-cache/`; the snapshot is the baseline when Figma has no version from before today. If the limit is hit, the report falls back to versions and comments.
 
 ```
 node report.js            # pick files

@@ -27,7 +27,7 @@ const MAX_RETRY_AFTER = 120; // seconds; a longer wait means the monthly/minute 
 const CONCURRENCY = 4; // Tier 2 is 25-100 req/min depending on plan; keep well under it
 const MAX_VERSION_PAGES = 5;
 
-const MIN_BULLETS_PER_FILE = 2;
+const MIN_BULLETS_PER_FILE = 1;
 const MAX_BULLETS_PER_FILE = 15;
 const MAX_LIST_ITEMS = 25; // names sent per diff category, to keep the prompt small
 const MAX_TEXT_LEN = 120;
@@ -306,6 +306,28 @@ async function loadSnapshot(key, versionId) {
     return snapshot;
 }
 
+// Version history can be empty (new files, or plans that keep only 30 days),
+// so every run also saves the file's current state per day. The latest one
+// from an earlier day is the fallback baseline.
+function saveDaySnapshot(key, snapshot) {
+    const file = path.join(CACHE_DIR, key, `day-${getLocalDateString()}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(snapshot));
+}
+
+function loadPreviousDaySnapshot(key) {
+    const dir = path.join(CACHE_DIR, key);
+    if (!fs.existsSync(dir)) return null;
+
+    const today = `day-${getLocalDateString()}.json`;
+    const latest = fs.readdirSync(dir)
+        .filter(f => /^day-\d{4}-\d{2}-\d{2}\.json$/.test(f) && f < today)
+        .sort()
+        .pop();
+
+    return latest ? JSON.parse(fs.readFileSync(path.join(dir, latest), "utf8")) : null;
+}
+
 function isScreen(n) {
     return n.type !== "TEXT" && n.type !== "INSTANCE" && SCREEN_PARENT_TYPES.has(n.parentType);
 }
@@ -330,7 +352,7 @@ function diffSnapshots(before, after) {
         pages_added: [], pages_removed: [], pages_renamed: [],
         screens_added: [], screens_removed: [], screens_renamed: [],
         components_added: [], components_removed: [], components_renamed: [],
-        text_changed: [], text_added: 0, text_removed: 0,
+        text_changed: [], text_added: [], text_removed: [],
         instances_added: {}, moved: 0, layers_added: 0, layers_removed: 0,
     };
 
@@ -343,7 +365,7 @@ function diffSnapshots(before, after) {
             if (n.type === "CANVAS") d.pages_added.push(n.name);
             else if (isComponent) d.components_added.push(label(n));
             else if (isScreen(n)) d.screens_added.push(label(n));
-            else if (n.type === "TEXT") d.text_added++;
+            else if (n.type === "TEXT") d.text_added.push(`${n.page}: "${truncate(n.text, 80)}"`);
             else if (n.type === "INSTANCE") {
                 const name = componentName(n.componentId);
                 d.instances_added[name] = (d.instances_added[name] || 0) + 1;
@@ -371,7 +393,7 @@ function diffSnapshots(before, after) {
         if (n.type === "CANVAS") d.pages_removed.push(n.name);
         else if (n.type === "COMPONENT" || n.type === "COMPONENT_SET") d.components_removed.push(label(n));
         else if (isScreen(n)) d.screens_removed.push(label(n));
-        else if (n.type === "TEXT") d.text_removed++;
+        else if (n.type === "TEXT") d.text_removed.push(`${n.page}: "${truncate(n.text, 80)}"`);
         else d.layers_removed++;
     }
 
@@ -384,7 +406,7 @@ function diffSize(d) {
         + 3 * (d.screens_added.length + d.components_added.length)
         + d.screens_removed.length + d.screens_renamed.length
         + d.components_removed.length + d.components_renamed.length
-        + d.text_changed.length + Math.ceil((d.text_added + d.text_removed) / 10)
+        + d.text_changed.length + Math.ceil((d.text_added.length + d.text_removed.length) / 5)
         + Object.keys(d.instances_added).length;
 }
 
@@ -433,10 +455,11 @@ async function collectTodayFiles(me) {
     })), CONCURRENCY);
 
     // last_touched_by only names the latest editor, so also accept files where
-    // any of today's versions was saved by me.
+    // any of today's versions was saved by me. Drafts can report it as null;
+    // then the file's creator is the best guess.
     return withVersions.filter(({ meta, versions }) => {
         if (!FIGMA_ONLY_MINE) return true;
-        const lastBy = meta.last_touched_by && meta.last_touched_by.id;
+        const lastBy = (meta.last_touched_by || meta.creator || {}).id;
         return lastBy === me.id || versions.today.some(v => v.user && v.user.id === me.id);
     }).sort((x, y) => new Date(y.meta.last_touched_at) - new Date(x.meta.last_touched_at));
 }
@@ -474,7 +497,7 @@ async function pickFiles(files) {
     console.log("   0) All files (full daily report)");
     files.forEach((f, i) => {
         const m = f.meta;
-        const by = m.last_touched_by ? m.last_touched_by.handle : "?";
+        const by = (m.last_touched_by || m.creator || { handle: "?" }).handle;
         const folder = m.folder_name ? `${m.folder_name} / ` : "";
         console.log(`   ${i + 1}) ${folder}${m.name}  — ${formatTime(m.last_touched_at)} by ${by}, ${f.versions.today.length} version(s)`);
     });
@@ -519,11 +542,12 @@ async function summarizeFile({ meta, versions }, budget) {
         try {
             const before = versions.baseline
                 ? await loadSnapshot(key, versions.baseline.id)
-                : { nodes: {}, other: 0, components: {} };
+                : loadPreviousDaySnapshot(key);
             const after = await loadSnapshot(key, null);
-            const diff = diffSnapshots(before, after);
+            saveDaySnapshot(key, after);
+            const diff = diffSnapshots(before || { nodes: {}, other: 0, components: {} }, after);
 
-            summary.created_today = !versions.baseline || undefined;
+            if (!before) summary.no_baseline = true;
             summary.size = diffSize(diff);
             summary.changes = compactDiff(diff);
         } catch (err) {
@@ -548,7 +572,7 @@ async function summarizeFile({ meta, versions }, budget) {
 
 /**
  * Reasoning models (gpt-oss, qwen3) can emit their chain of thought inline in
- * the message content. Strip it so it never reaches today-work.md.
+ * the message content. Strip it so it never reaches today-figma.md.
  * Also handles an unterminated opening tag, which happens on truncated output.
  */
 function stripReasoning(text) {
@@ -639,12 +663,13 @@ async function generateReport(summaries) {
 You receive one entry per Figma file the designer worked on today. Each entry carries:
 - changes: what differs between the start of the day and now. pages_*, screens_* (top-level frames
   and sections), components_* (reusable design components), text_changed (copy edits, old → new),
-  text_added / text_removed (counts of text layers), instances_added (component name → how many
+  text_added / text_removed (text that appeared or was deleted, with its page), instances_added (component name → how many
   times it was placed), moved (layers moved to a new parent), layers_added / layers_removed.
 - named_versions: versions the designer saved with a label or description. These are the
   designer's own words about the work; trust them most.
 - comments: today's comments on the file.
-- created_today: the file did not exist before today.
+- no_baseline: no earlier state of the file was found, so changes list everything in the file.
+  It may be new today or older; write "Worked on" instead of claiming it was all created today.
 - note: present when the detailed changes could not be fetched.
 - min_bullets and max_bullets: the bullet budget for that file.
 
@@ -728,8 +753,9 @@ function writeReportToFile(report) {
 
     const reportsDir = ensureFolders();
 
-    const todayFile = path.join(__dirname, "today-work.md");
-    const historyFile = path.join(reportsDir, `${date}.md`);
+    // Separate names so the GitHub report (other branches) is never overwritten.
+    const todayFile = path.join(__dirname, "today-figma.md");
+    const historyFile = path.join(reportsDir, `figma-${date}.md`);
 
     fs.writeFileSync(todayFile, report);
     fs.writeFileSync(historyFile, report);
@@ -770,8 +796,8 @@ async function main() {
     writeReportToFile(report);
 
     console.log("\n✅ DONE");
-    console.log("📄 today-work.md updated");
-    console.log(`📁 reports/${getLocalDateString()}.md created`);
+    console.log("📄 today-figma.md updated");
+    console.log(`📁 reports/figma-${getLocalDateString()}.md created`);
 }
 
 main().catch(err => {

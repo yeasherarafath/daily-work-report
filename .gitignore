@@ -4,3 +4,4 @@ reports/
 node_modules/
 package-lock.json
 .figma-cache/
+today-figma.md
