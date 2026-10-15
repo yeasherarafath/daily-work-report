@@ -2,173 +2,86 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 const axios = require("axios");
-const { execSync } = require("child_process");
-const { log } = require("console");
 
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
+const FIGMA_TOKEN = process.env.FIGMA_TOKEN;
+const FIGMA_TEAM_IDS = splitList(process.env.FIGMA_TEAM_IDS);
+const FIGMA_FILE_KEYS = splitList(process.env.FIGMA_FILE_KEYS).map(parseFileKey).filter(Boolean);
+const FIGMA_ONLY_MINE = process.env.FIGMA_ONLY_MINE !== "false";
+
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const REASONING_EFFORT = process.env.GROQ_REASONING_EFFORT;
 
 const GROQ_URL = "https://newisty.com/api/ai/v1/chat/completions";
-
-const GH_HEADERS = {
-    Authorization: `Bearer ${GITHUB_TOKEN}`,
-    Accept: "application/vnd.github+json"
-};
+const FIGMA_API = "https://api.figma.com";
 
 const GROQ_TIMEOUT = 180000; // 3 min, stays under cron.ps1's 300s process kill
 const MAX_LLM_RETRIES = 3;
 const MAX_COMPLETION_TOKENS = 8192;
 
-const MAX_REPO_PAGES = 6;
-const MAX_BRANCH_PAGES = 3;
-const MIN_BULLETS_PER_REPO = 6; // per repository, when its commits hold the material
-const MAX_BULLETS_PER_REPO = 43; // per repository
-const CONCURRENCY = 8; // parallel GitHub requests; well under the secondary rate limit
+const FIGMA_TIMEOUT = 120000; // full file JSON can be tens of MB
+const MAX_FIGMA_RETRIES = 3;
+const MAX_RETRY_AFTER = 120; // seconds; a longer wait means the monthly/minute budget is gone
+const CONCURRENCY = 4; // Tier 2 is 25-100 req/min depending on plan; keep well under it
+const MAX_VERSION_PAGES = 5;
 
-const SMALL_COMMIT_LINES = 600; // below this a commit shares a bullet with its neighbours
-const BIG_CHANGE_LINES = 2000;   // above this a commit is worth 3 bullets
-const HUGE_CHANGE_LINES = 6000;  // above this a commit is worth 4
-const BROAD_COMMIT_AREAS = 6;    // a commit touching this many feature areas is worth more bullets
-const MAX_AREAS_PER_COMMIT = 5; // area names sent per commit, to keep the prompt small
-const MAX_STAT_COMMITS = 150;    // ceiling on per-commit stat requests per run
+const MIN_BULLETS_PER_FILE = 2;
+const MAX_BULLETS_PER_FILE = 15;
+const MAX_LIST_ITEMS = 25; // names sent per diff category, to keep the prompt small
+const MAX_TEXT_LEN = 120;
 
-// Generated and vendored files. A lockfile refresh outweighs a real feature if
-// these count toward a commit's size.
-const IGNORED_PATH_RE = /(^|\/)(vendor|node_modules|dist|build)\/|\.lock$|package-lock\.json$|\.min\.(js|css)$|\.map$|\.svg$/i;
+const CACHE_DIR = path.join(__dirname, ".figma-cache");
+
+// Node types that represent real design work. Vectors, ellipses and the like
+// churn on every nudge and say nothing a CEO can read.
+const TRACKED_TYPES = new Set([
+    "FRAME", "SECTION", "COMPONENT", "COMPONENT_SET", "INSTANCE", "TEXT", "GROUP",
+]);
+
+const SCREEN_PARENT_TYPES = new Set(["CANVAS", "SECTION"]);
+
+class RateLimitError extends Error {}
+
+function splitList(value) {
+    return (value || "").split(",").map(s => s.trim()).filter(Boolean);
+}
+
+// Accepts a bare key or any figma.com file/design/board URL.
+function parseFileKey(value) {
+    const m = value.match(/figma\.com\/(?:file|design|board|proto)\/([A-Za-z0-9]+)/);
+    if (m) return m[1];
+    return /^[A-Za-z0-9]+$/.test(value) ? value : null;
+}
 
 /* ---------------------------
    DATE HELPERS
 ----------------------------*/
 
-function getStartOfDayISO() {
+function getStartOfDay() {
     const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
-    return start.toISOString();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
 }
 
-function getDateString() {
-    return new Date().toISOString().split("T")[0];
-}
-
-// Local calendar date. getDateString() is UTC, so at UTC+6 it still returns
-// yesterday until 06:00 local - wrong day for GitHub's date qualifiers.
 function getLocalDateString() {
     const d = new Date();
     const pad = n => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function isToday(iso) {
+    return Boolean(iso) && new Date(iso) >= getStartOfDay();
+}
+
+function formatTime(iso) {
+    return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 /* ---------------------------
-   GITHUB: GLOBAL COMMITS
+   GENERIC HELPERS
 ----------------------------*/
 
-// GitHub's commit search, paginated. Covers every repo the token can see,
-// so repos are not discovered through the events feed.
-async function searchCommits(dateField, date) {
-    const q = `author:${GITHUB_USERNAME} ${dateField}:${date}`;
-    const items = [];
-
-    for (let page = 1; page <= 3; page++) {
-        const url = `https://api.github.com/search/commits?q=${encodeURIComponent(q)}&per_page=100&page=${page}`;
-        const res = await axios.get(url, { headers: GH_HEADERS });
-        const pageItems = res.data?.items || [];
-        items.push(...pageItems);
-        if (pageItems.length < 100) break;
-    }
-
-    return items;
-}
-
-// Repos this user pushed to today, from the events feed.
-// Only used to widen the repo list - branches come from the branches API.
-async function fetchReposFromEvents(since) {
-    const repos = new Set();
-
-    // The events feed is capped at 300 and is NOT sorted by date, so all
-    // three pages must be read or today's pushes can be missed.
-    for (let page = 1; page <= 3; page++) {
-        const url = `https://api.github.com/users/${GITHUB_USERNAME}/events?per_page=100&page=${page}`;
-        let events;
-
-        try {
-            const res = await axios.get(url, { headers: GH_HEADERS });
-            events = res.data || [];
-        } catch (err) {
-            console.error(`⚠️ Failed to fetch events page ${page}:`, err.message);
-            break;
-        }
-
-        for (const event of events) {
-            if (event.type !== "PushEvent") continue;
-            if (new Date(event.created_at) < new Date(since)) continue;
-            if (event.repo?.name) repos.add(event.repo.name);
-        }
-
-        if (events.length < 100) break;
-    }
-
-    return repos;
-}
-
-// Repos touched today, across every affiliation. Sorted by push time, so the
-// walk stops at the first repo that went quiet before today.
-async function fetchActiveRepos(since) {
-    const repos = new Set();
-
-    for (let page = 1; page <= MAX_REPO_PAGES; page++) {
-        const url = `https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&direction=desc&per_page=100&page=${page}`;
-        let items;
-
-        try {
-            const res = await axios.get(url, { headers: GH_HEADERS });
-            items = res.data || [];
-        } catch (err) {
-            console.error(`⚠️ Failed to fetch repo page ${page}:`, err.message);
-            break;
-        }
-
-        let stop = false;
-        for (const r of items) {
-            if (!r.pushed_at || new Date(r.pushed_at) < new Date(since)) {
-                stop = true;
-                break;
-            }
-            repos.add(r.full_name);
-        }
-
-        if (stop || items.length < 100) break;
-    }
-
-    return repos;
-}
-
-// Branch heads, deduped by commit SHA. Stale branches that share a head with
-// another branch cost one commits request instead of several - the commits API
-// takes a raw SHA in ?sha= just as happily as a branch name.
-async function fetchBranchHeads(repo) {
-    const heads = new Map(); // key: head sha, value: branch name (for error output)
-
-    for (let page = 1; page <= MAX_BRANCH_PAGES; page++) {
-        const url = `https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`;
-        const res = await axios.get(url, { headers: GH_HEADERS });
-        const items = res.data || [];
-
-        for (const b of items) {
-            if (b.commit?.sha && !heads.has(b.commit.sha)) heads.set(b.commit.sha, b.name);
-        }
-
-        if (items.length < 100) break;
-    }
-
-    return heads;
-}
-
-// Runs tasks with a bounded number in flight. The branch walk is ~60 requests
-// of pure network wait, so serial execution wastes most of the runtime.
 async function runPooled(tasks, limit) {
     const results = [];
     let next = 0;
@@ -184,482 +97,450 @@ async function runPooled(tasks, limit) {
     return results;
 }
 
-async function fetchCommits() {
-    const since = getStartOfDayISO();
-    const today = getLocalDateString();
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-    const commits = [];
-    const seenShas = new Set();
+function truncate(text, max = MAX_TEXT_LEN) {
+    const clean = String(text || "").replace(/\s+/g, " ").trim();
+    return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
+}
 
-    const add = (sha, repo, message) => {
-        if (!sha || seenShas.has(sha)) return;
-        seenShas.add(sha);
-        commits.push({
-            sha,
-            repository: {
-                full_name: repo
-            },
-            commit: {
-                message: message || ""
-            }
-        });
-    };
+/* ---------------------------
+   FIGMA API
+----------------------------*/
 
-    const repos = new Set();
+/**
+ * GET against the Figma REST API. Short 429 waits are retried; a long
+ * Retry-After means the tier budget is spent, so it surfaces as
+ * RateLimitError and the caller falls back to cheaper data.
+ */
+async function figmaGet(urlPath, params = {}) {
+    const url = urlPath.startsWith("http") ? urlPath : FIGMA_API + urlPath;
+    let lastError;
 
-    const searchTasks = ["author-date", "committer-date"].map(field => async () => {
+    for (let attempt = 1; attempt <= MAX_FIGMA_RETRIES; attempt++) {
         try {
-            // Search only indexes each repo's DEFAULT branch, so this is a fast
-            // path, not full coverage. committer-date catches rebased work.
-            return await searchCommits(field, today);
-        } catch (err) {
-            console.error(`⚠️ Commit search failed for ${field}:`, err.message);
-            return [];
-        }
-    });
-
-    // Repo discovery and the commit search do not depend on each other.
-    const [searchResults, activeRepos, eventRepos] = await Promise.all([
-        runPooled(searchTasks, CONCURRENCY),
-        fetchActiveRepos(since),
-        fetchReposFromEvents(since)
-    ]);
-
-    for (const items of searchResults) {
-        for (const c of items) {
-            const repo = c.repository?.full_name;
-            if (repo) repos.add(repo);
-            add(c.sha, repo, c.commit?.message);
-        }
-    }
-
-    for (const r of activeRepos) repos.add(r);
-    for (const r of eventRepos) repos.add(r);
-
-    // Walk every branch of every active repo. This is what picks up work on
-    // feature branches, which commit search never returns.
-    const headLists = await runPooled([...repos].map(repo => async () => {
-        try {
-            return { repo, heads: await fetchBranchHeads(repo) };
-        } catch (err) {
-            console.error(`⚠️ Failed to fetch branches for ${repo}:`, err.message);
-            return { repo, heads: new Map() };
-        }
-    }), CONCURRENCY);
-
-    const commitTasks = [];
-
-    for (const { repo, heads } of headLists) {
-        for (const [sha, branch] of heads) {
-            commitTasks.push(async () => {
-                try {
-                    const commitsUrl = `https://api.github.com/repos/${repo}/commits?sha=${sha}&since=${since}&author=${encodeURIComponent(GITHUB_USERNAME)}&per_page=100`;
-                    const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
-                    return { repo, commits: commitsRes.data || [] };
-                } catch (err) {
-                    // 409 = empty repo, not worth reporting
-                    if (err.response?.status !== 409) {
-                        console.error(`⚠️ Failed to fetch commits for ${repo} branch ${branch}:`, err.message);
-                    }
-                    return { repo, commits: [] };
-                }
+            const res = await axios.get(url, {
+                params,
+                headers: { "X-Figma-Token": FIGMA_TOKEN },
+                timeout: FIGMA_TIMEOUT,
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
             });
-        }
-    }
-
-    for (const { repo, commits: branchCommits } of await runPooled(commitTasks, CONCURRENCY)) {
-        for (const c of branchCommits) add(c.sha, repo, c.commit?.message);
-    }
-
-    return commits;
-}
-
-/* ---------------------------
-   GITHUB: PRs
-----------------------------*/
-
-async function fetchPRs() {
-    const since = getLocalDateString();
-
-    const query = `author:${GITHUB_USERNAME} type:pr created:${since}`;
-
-    const url =
-        `https://api.github.com/search/issues?q=${encodeURIComponent(query)}`;
-
-    const res = await axios.get(url, { headers: GH_HEADERS });
-
-    const items = res.data.items || [];
-
-    for (const item of items) {
-        const repoFull = item.repository_url
-            ? item.repository_url.split("/").slice(-2).join("/")
-            : null;
-        if (!repoFull || !item.number) continue;
-
-        try {
-            const commitsUrl = `https://api.github.com/repos/${repoFull}/pulls/${item.number}/commits`;
-            const commitsRes = await axios.get(commitsUrl, { headers: GH_HEADERS });
-            item.pr_commits = (commitsRes.data || []).map(c => ({
-                sha: c.sha,
-                message: c.commit?.message || ""
-            }));
+            return res.data;
         } catch (err) {
-            console.error(`⚠️ Failed to fetch commits for PR #${item.number} in ${repoFull}:`, err.message);
-            item.pr_commits = [];
-        }
-    }
+            lastError = err;
+            const status = err.response && err.response.status;
 
-    return items;
-}
-
-/* ---------------------------
-   GROUP BY REPO
-----------------------------*/
-
-function groupData(commits, prs) {
-    const grouped = {};
-    const seenShas = new Set();
-
-    for (const c of commits) {
-        const repo = c.repository.full_name;
-
-        if (!grouped[repo]) grouped[repo] = { commits: [], prs: [] };
-
-        grouped[repo].commits.push({
-            sha: c.sha,
-            message: c.commit.message,
-        });
-        if (c.sha) seenShas.add(c.sha);
-    }
-
-    for (const p of prs) {
-        const repo = p.repository_url
-            ? p.repository_url.split("/").slice(-2).join("/")
-            : "unknown";
-
-        if (!grouped[repo]) grouped[repo] = { commits: [], prs: [] };
-
-        grouped[repo].prs.push({
-            title: p.title,
-            commits: (p.pr_commits || []).map(c => c.message),
-        });
-
-        for (const c of (p.pr_commits || [])) {
-            if (!seenShas.has(c.sha)) {
-                seenShas.add(c.sha);
-                grouped[repo].commits.push({
-                    sha: c.sha,
-                    message: c.message,
-                });
+            if (status === 429) {
+                const wait = Number(err.response.headers["retry-after"]) || 60;
+                if (wait > MAX_RETRY_AFTER || attempt === MAX_FIGMA_RETRIES) {
+                    throw new RateLimitError(
+                        `Figma rate limit on ${urlPath} (retry after ${wait}s, ` +
+                        `plan tier ${err.response.headers["x-figma-plan-tier"] || "?"}, ` +
+                        `limit type ${err.response.headers["x-figma-rate-limit-type"] || "?"})`
+                    );
+                }
+                console.log(`⏳ Figma 429, waiting ${wait}s...`);
+                await sleep(wait * 1000);
+                continue;
             }
+
+            if (status && status < 500) break;
+            if (attempt < MAX_FIGMA_RETRIES) await sleep(Math.pow(2, attempt) * 1000);
         }
     }
 
-    return grouped;
+    const status = lastError.response && lastError.response.status;
+    const detail = lastError.response && lastError.response.data
+        ? JSON.stringify(lastError.response.data).slice(0, 300)
+        : lastError.message;
+    throw new Error(`Figma GET ${urlPath} failed${status ? ` HTTP ${status}` : ""}: ${detail}`);
 }
 
-/* ---------------------------
-   COMMIT SIZE
-----------------------------*/
+async function fetchMe() {
+    return figmaGet("/v1/me");
+}
 
-// Diff size for one commit. The commit LIST endpoint returns neither stats nor
-// files, so the size of a day's work is only visible one commit at a time.
-async function fetchCommitStats(repo, sha) {
+// Walks a team's folders (and their subfolders). Falls back to the deprecated
+// v1 projects endpoints, which still serve accounts without v2 folders.
+async function fetchTeamFileKeys(teamId) {
     try {
-        const url = `https://api.github.com/repos/${repo}/commits/${sha}`;
-        const res = await axios.get(url, { headers: GH_HEADERS });
-        return res.data || null;
-    } catch (err) {
-        console.error(`⚠️ Failed to fetch stats for ${repo}@${sha.slice(0, 7)}:`, err.message);
-        return null;
-    }
-}
+        const keys = [];
+        const top = await figmaGet(`/v2/teams/${teamId}/folders`);
+        const queue = [...(top.folders || [])];
 
-// Leading framework folders say nothing about what was built.
-const GENERIC_SEGMENTS = new Set(["src", "app", "lib", "packages", "resources"]);
-
-// Feature area a changed file belongs to.
-function pathArea(filename) {
-    const parts = filename.split("/").filter(Boolean);
-    const dirs = parts.slice(0, -1);
-
-    if (!dirs.length) return parts[parts.length - 1] || filename;
-
-    let start = 0;
-    while (start < dirs.length - 1 && GENERIC_SEGMENTS.has(dirs[start].toLowerCase())) start++;
-
-    // The two folders closest to the file name the feature; the ones above them
-    // are framework structure - "app/Http" does not say what shipped.
-    return dirs.slice(start).slice(-2).join("/");
-}
-
-// Changed lines and the areas they landed in, ignoring generated files.
-function summarizeFiles(data) {
-    const files = data.files || [];
-    const byArea = new Map();
-    const featureAreas = new Set();
-    let lines = 0;
-
-    for (const f of files) {
-        if (!f.filename || IGNORED_PATH_RE.test(f.filename)) continue;
-
-        const changes = typeof f.changes === "number"
-            ? f.changes
-            : (f.additions || 0) + (f.deletions || 0);
-        const area = pathArea(f.filename);
-
-        lines += changes;
-        byArea.set(area, (byArea.get(area) || 0) + changes);
-
-        // Tests, docs, routes and migrations follow a feature; they are not one.
-        if (!/(^|\/)(tests?|postman|docs?|database|routes|config)(\/|$)/i.test(f.filename)) featureAreas.add(area);
-    }
-
-    // GitHub truncates the file list above 300 files; stats still cover the
-    // whole commit, so they are the fallback when no file survived.
-    if (!lines && data.stats) {
-        lines = (data.stats.additions || 0) + (data.stats.deletions || 0);
-    }
-
-    const areas = [...byArea.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, MAX_AREAS_PER_COMMIT)
-        .map(([area]) => area);
-
-    return { lines, areas, breadth: featureAreas.size };
-}
-
-// Attaches diff size to every commit worth reporting. Noise is dropped first,
-// so no request is spent on a "wip" commit that simplify() would discard.
-async function enrichWithStats(grouped) {
-    const targets = [];
-
-    for (const repo in grouped) {
-        const kept = (grouped[repo].commits || []).filter(c => !isNoise(c && c.message));
-        grouped[repo].commits = kept;
-
-        for (const c of kept) {
-            if (c.sha) targets.push({ repo, commit: c });
+        while (queue.length) {
+            const folder = queue.shift();
+            const [files, subs] = await Promise.all([
+                figmaGet(`/v2/folders/${folder.id}/files`),
+                figmaGet(`/v2/folders/${folder.id}/folders`).catch(() => ({ folders: [] })),
+            ]);
+            for (const f of files.files || []) keys.push(f.key);
+            queue.push(...(subs.folders || []));
         }
+
+        return keys;
+    } catch (err) {
+        if (err instanceof RateLimitError) throw err;
+        console.log(`   v2 folders unavailable for team ${teamId}, using v1 projects`);
     }
 
-    const budgeted = targets.slice(0, MAX_STAT_COMMITS);
+    const keys = [];
+    const { projects = [] } = await figmaGet(`/v1/teams/${teamId}/projects`);
+    const lists = await runPooled(
+        projects.map(p => () => figmaGet(`/v1/projects/${p.id}/files`)),
+        CONCURRENCY
+    );
+    for (const list of lists) for (const f of list.files || []) keys.push(f.key);
+    return keys;
+}
 
-    if (targets.length > budgeted.length) {
-        console.warn(
-            `⚠️  ${targets.length} commits to measure, fetching stats for the first ${MAX_STAT_COMMITS}. ` +
-            "The rest fall back to count-based budgeting."
-        );
+async function fetchMeta(key) {
+    const data = await figmaGet(`/v1/files/${key}/meta`);
+    return { key, ...data.file };
+}
+
+// Versions are newest first. Stop paging once one predates today: that one
+// is the baseline the day's work is diffed against.
+async function fetchTodayVersions(key) {
+    const start = getStartOfDay();
+    const today = [];
+    let baseline = null;
+    let next = `/v1/files/${key}/versions`;
+
+    for (let page = 0; next && page < MAX_VERSION_PAGES; page++) {
+        const data = await figmaGet(next);
+
+        for (const v of data.versions || []) {
+            if (new Date(v.created_at) >= start) {
+                today.push(v);
+            } else {
+                baseline = v;
+                break;
+            }
+        }
+
+        if (baseline) break;
+        next = data.pagination && data.pagination.next_page;
     }
 
-    console.log(`📏 Measuring ${budgeted.length} commit(s)...`);
+    today.reverse();
 
-    await runPooled(budgeted.map(({ repo, commit }) => async () => {
-        const data = await fetchCommitStats(repo, commit.sha);
-        if (!data) return;
+    // Paging stopped before reaching yesterday: diff from the oldest version
+    // seen rather than treating the whole file as new.
+    if (!baseline && next && today.length) baseline = today[0];
 
-        const { lines, areas, breadth } = summarizeFiles(data);
-        commit.lines = lines;
-        commit.areas = areas;
-        commit.breadth = breadth;
-    }), CONCURRENCY);
+    return { today, baseline };
+}
 
-    return grouped;
+async function fetchTodayComments(key) {
+    try {
+        const data = await figmaGet(`/v1/files/${key}/comments`);
+        return (data.comments || []).filter(c => isToday(c.created_at));
+    } catch (err) {
+        console.warn(`⚠️  Comments skipped for ${key}: ${err.message}`);
+        return [];
+    }
 }
 
 /* ---------------------------
-   HELPER: SIMPLIFY FOR AI
+   SNAPSHOTS + DIFF
 ----------------------------*/
-// How many bullets a repo is allowed, derived from real commit volume.
-// A repo with one commit must not produce a dozen deliverables - that is what
-// made earlier reports read as padded.
-// What one commit is worth, from its diff size. A 10k-line module is not one
-// bullet's worth of work, and a typo fix is not three.
-// Unknown size (stats request failed, or over MAX_STAT_COMMITS) counts as small.
-function commitBullets(lines, breadth) {
-    if (typeof lines !== "number") return 1;
-    let n = 1;
-    if (lines >= HUGE_CHANGE_LINES) n = 4;
-    else if (lines >= BIG_CHANGE_LINES) n = 3;
-    else if (lines >= SMALL_COMMIT_LINES) n = 2;
 
-    // A commit spread over many features is several deliverables whatever its size.
-    if (breadth >= BROAD_COMMIT_AREAS) n = Math.max(n, 2) + (breadth >= BROAD_COMMIT_AREAS * 2 ? 1 : 0);
-    return n;
-}
+/**
+ * Flattens a document into id -> summary of the nodes worth reporting.
+ * Only the summary is kept, so cached snapshots stay a few hundred KB.
+ */
+function flattenDocument(document) {
+    const nodes = {};
+    let other = 0;
 
-// A repository's budget is MIN_BULLETS_PER_REPO..MAX_BULLETS_PER_REPO, but only
-// as far as real material goes (distinct commits and areas) - never pads. A repo
-// with little work gets a smaller budget instead of invented bullets.
-// Scaled by worth (sum of commitBullets), so a repo with one small task is not
-// forced to many bullets: worth 3 -> 1-2, worth 8 -> 4-5, worth 34+ -> 6-20.
-function bulletBudget(capacity, worth) {
-    const room = Math.max(1, capacity);
-    const min = Math.min(MIN_BULLETS_PER_REPO, room, Math.max(1, Math.floor(worth / 2)));
-    const max = Math.min(MAX_BULLETS_PER_REPO, room, Math.max(min + 1, Math.ceil(worth * 0.6)));
-
-    return { min, max: Math.max(min, max) };
-}
-
-function simplify(data) {
-    const result = {};
-
-    for (const repo in data) {
-        const cleaned = [];
-        let totalLines = 0;
-        let repoCapacity = 0;
-        let repoWorth = 0;
-
-        for (const c of data[repo].commits || []) {
-            const msg = c?.msg || c?.message || "";
-
-            if (isNoise(msg)) continue;
-
-            const entry = { message: cleanMessage(msg, repo) };
-
-            // Absent for commits whose stats request failed or was over budget.
-            if (typeof c.lines === "number") {
-                entry.lines = c.lines;
-                totalLines += c.lines;
-            }
-
-            if (c.areas?.length) entry.areas = c.areas;
-
-            entry.bullets = commitBullets(c.lines, c.breadth);
-            repoWorth += entry.bullets;
-            repoCapacity += Math.max(1, c.areas?.length || 0);
-
-            cleaned.push(entry);
+    function walk(node, page, parent) {
+        if (node.type === "CANVAS") {
+            nodes[node.id] = { type: "CANVAS", name: node.name };
+            page = node.name;
+        } else if (TRACKED_TYPES.has(node.type)) {
+            const entry = {
+                type: node.type,
+                name: node.name,
+                page,
+                parent: parent && parent.id,
+                parentType: parent && parent.type,
+            };
+            if (node.type === "TEXT") entry.text = truncate(node.characters, 400);
+            if (node.type === "INSTANCE") entry.componentId = node.componentId;
+            nodes[node.id] = entry;
+        } else {
+            other++;
         }
 
-        // Repos whose commits were all noise carry no signal worth a section.
-        if (!cleaned.length) continue;
-
-        // Biggest work first. The model follows input order, and the bullet
-        // limit trims from the end, so a large module must not sit last.
-        cleaned.sort((a, b) => (b.lines || 0) - (a.lines || 0));
-
-        const budget = bulletBudget(repoCapacity, repoWorth);
-
-        // Big commits must not eat the budget small, distinct commits need. Each
-        // small commit keeps a slot; big commits share what is left.
-        const smallCount = cleaned.filter(c => c.bullets === 1).length;
-        // Shrink big commits only against the hard per-repo ceiling, not the
-        // worth-scaled max - that max was derived from these same commits.
-        const spare = MAX_BULLETS_PER_REPO - smallCount;
-        const bigOnes = cleaned.filter(c => c.bullets > 1);
-
-        while (bigOnes.reduce((n, c) => n + c.bullets, 0) > Math.max(spare, bigOnes.length)) {
-            const widest = bigOnes.reduce((a, b) => (b.bullets > a.bullets ? b : a));
-            if (widest.bullets <= 1) break;
-            widest.bullets--;
-        }
-
-        const reserved = cleaned.reduce((n, c) => n + c.bullets, 0);
-        budget.max = Math.min(MAX_BULLETS_PER_REPO, Math.max(budget.max, Math.min(reserved, MAX_BULLETS_PER_REPO)));
-        // Every bullet a big commit is owed counts toward the floor, so the
-        // model cannot collapse a big module into one line.
-        const bigOwed = bigOnes.reduce((n, c) => n + c.bullets, 0);
-        budget.min = Math.min(Math.max(budget.min, bigOwed + Math.min(smallCount, 1)), budget.max);
-
-        result[repo] = {
-            commit_count: cleaned.length,
-            total_lines: totalLines,
-            min_bullets: budget.min,
-            max_bullets: budget.max,
-            commits: cleaned
-        };
+        for (const child of node.children || []) walk(child, page, node);
     }
 
-    return { result };
+    walk(document, null, null);
+    return { nodes, other };
 }
 
-function cleanMessage(msg, repo) {
-    return msg
-        // "fix(validation): x" -> "validation: x". Dropping only "fix(" left a dangling ")".
-        .replace(/^(feat|fix|refactor|docs|test|chore|perf|style)\(([^)]*)\)!?:\s*/i, '$2: ')
-        .replace(/^(feat|fix|refactor|docs|test|chore|perf|style)!?:\s*/i, '')
-        .replace(/merge branch.*$/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim();
+function cachePath(key, versionId) {
+    return path.join(CACHE_DIR, key, `${versionId}.json`);
 }
 
-function isNoise(msg) {
-    if (!msg || typeof msg !== "string") return true;
+// Past versions never change, so their flattened snapshot is cached forever.
+// The current file is always fetched fresh.
+async function loadSnapshot(key, versionId) {
+    if (versionId) {
+        const file = cachePath(key, versionId);
+        if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+    }
 
-    const m = msg.toLowerCase().trim();
+    const data = await figmaGet(`/v1/files/${key}`, versionId ? { version: versionId } : {});
+    const snapshot = { ...flattenDocument(data.document), components: data.components || {} };
 
-    if (m.length < 8) return true;
+    if (versionId) {
+        fs.mkdirSync(path.dirname(cachePath(key, versionId)), { recursive: true });
+        fs.writeFileSync(cachePath(key, versionId), JSON.stringify(snapshot));
+    }
 
-    // Merge commits describe branch plumbing, not delivered work.
-    if (m.startsWith("merge branch") || m.startsWith("merge pull request") || m.startsWith("merge remote")) return true;
-
-    return (
-        m === "debug" ||
-        m === "done" ||
-        m === "wip" ||
-        m.startsWith("wip:") ||
-        m.startsWith("wip ") ||
-        m === "update readme" ||
-        m === "initial commit" ||
-        /^(fix|test|update|chore|cleanup|minor fix)(\.|!)?$/.test(m)
-    );
+    return snapshot;
 }
 
-// The model treats bullet limits as suggestions. This does not.
-// Trims each "## repo" section to that repo's budget and reports when it fires.
-function enforceBulletLimits(markdown, simplified) {
-    const lines = markdown.split("\n");
-    const out = [];
+function isScreen(n) {
+    return n.type !== "TEXT" && n.type !== "INSTANCE" && SCREEN_PARENT_TYPES.has(n.parentType);
+}
 
-    let repo = null;
-    let budget = Infinity;
-    let used = 0;
-    let trimmed = 0;
-    const thin = [];
+function label(n) {
+    return n.page ? `${n.page} / ${n.name}` : n.name;
+}
 
-    // A section is only known to be short once the next one starts.
-    const closeSection = () => {
-        const floor = repo ? simplified[repo]?.min_bullets ?? 0 : 0;
-        if (used < floor) thin.push(`${repo} (${used}/${floor})`);
+function cap(list) {
+    return list.length > MAX_LIST_ITEMS
+        ? [...list.slice(0, MAX_LIST_ITEMS), `…and ${list.length - MAX_LIST_ITEMS} more`]
+        : list;
+}
+
+/** Compares two flattened snapshots by node id. */
+function diffSnapshots(before, after) {
+    const a = before.nodes;
+    const b = after.nodes;
+    const componentName = id => (after.components[id] || before.components[id] || {}).name || "unknown";
+
+    const d = {
+        pages_added: [], pages_removed: [], pages_renamed: [],
+        screens_added: [], screens_removed: [], screens_renamed: [],
+        components_added: [], components_removed: [], components_renamed: [],
+        text_changed: [], text_added: 0, text_removed: 0,
+        instances_added: {}, moved: 0, layers_added: 0, layers_removed: 0,
     };
 
-    for (const line of lines) {
-        const heading = line.match(/^##\s+(.+?)\s*$/);
+    for (const id in b) {
+        const n = b[id];
+        const old = a[id];
+        const isComponent = n.type === "COMPONENT" || n.type === "COMPONENT_SET";
 
-        if (heading) {
-            closeSection();
-            repo = heading[1];
-            budget = simplified[repo]?.max_bullets ?? Infinity;
-            used = 0;
-            out.push(line);
+        if (!old) {
+            if (n.type === "CANVAS") d.pages_added.push(n.name);
+            else if (isComponent) d.components_added.push(label(n));
+            else if (isScreen(n)) d.screens_added.push(label(n));
+            else if (n.type === "TEXT") d.text_added++;
+            else if (n.type === "INSTANCE") {
+                const name = componentName(n.componentId);
+                d.instances_added[name] = (d.instances_added[name] || 0) + 1;
+            } else d.layers_added++;
             continue;
         }
 
-        if (/^\s*[-*]\s+/.test(line)) {
-            if (used >= budget) {
-                trimmed++;
-                continue;
-            }
-            used++;
+        if (old.name !== n.name) {
+            const rename = `${old.name} → ${n.name}`;
+            if (n.type === "CANVAS") d.pages_renamed.push(rename);
+            else if (isComponent) d.components_renamed.push(rename);
+            else if (isScreen(n)) d.screens_renamed.push(rename);
         }
 
-        out.push(line);
+        if (n.type === "TEXT" && old.text !== n.text) {
+            d.text_changed.push(`${n.page} / ${n.name}: "${truncate(old.text, 60)}" → "${truncate(n.text, 60)}"`);
+        }
+
+        if (n.type !== "CANVAS" && old.parent !== n.parent) d.moved++;
     }
 
-    closeSection();
-
-    if (trimmed) {
-        console.warn(`⚠️  Trimmed ${trimmed} over-budget bullet(s) - the model ignored max_bullets.`);
+    for (const id in a) {
+        if (b[id]) continue;
+        const n = a[id];
+        if (n.type === "CANVAS") d.pages_removed.push(n.name);
+        else if (n.type === "COMPONENT" || n.type === "COMPONENT_SET") d.components_removed.push(label(n));
+        else if (isScreen(n)) d.screens_removed.push(label(n));
+        else if (n.type === "TEXT") d.text_removed++;
+        else d.layers_removed++;
     }
 
-    if (thin.length) {
-        console.warn(`⚠️  Under-written section(s): ${thin.join(", ")} - fewer bullets than min_bullets.`);
-    }
-
-    return out.join("\n");
+    d.other_layers_delta = after.other - before.other;
+    return d;
 }
 
+function diffSize(d) {
+    return d.pages_added.length + d.pages_removed.length + d.pages_renamed.length
+        + 3 * (d.screens_added.length + d.components_added.length)
+        + d.screens_removed.length + d.screens_renamed.length
+        + d.components_removed.length + d.components_renamed.length
+        + d.text_changed.length + Math.ceil((d.text_added + d.text_removed) / 10)
+        + Object.keys(d.instances_added).length;
+}
+
+function compactDiff(d) {
+    const out = {};
+    for (const [k, v] of Object.entries(d)) {
+        if (Array.isArray(v)) { if (v.length) out[k] = cap(v); }
+        else if (typeof v === "object") { if (Object.keys(v).length) out[k] = v; }
+        else if (v) out[k] = v;
+    }
+    return out;
+}
+
+/* ---------------------------
+   COLLECT TODAY'S FILES
+----------------------------*/
+
+async function collectTodayFiles(me) {
+    const keys = new Set(FIGMA_FILE_KEYS);
+
+    for (const teamId of FIGMA_TEAM_IDS) {
+        console.log(`📂 Listing files in team ${teamId}...`);
+        for (const key of await fetchTeamFileKeys(teamId)) keys.add(key);
+    }
+
+    if (!keys.size) {
+        throw new Error("No Figma files to check. Set FIGMA_TEAM_IDS and/or FIGMA_FILE_KEYS in .env.");
+    }
+
+    console.log(`🔎 Checking ${keys.size} file(s) for today's changes...`);
+
+    const metas = await runPooled([...keys].map(key => async () => {
+        try {
+            return await fetchMeta(key);
+        } catch (err) {
+            console.warn(`⚠️  Skipped ${key}: ${err.message}`);
+            return null;
+        }
+    }), CONCURRENCY);
+
+    const touched = metas.filter(m => m && isToday(m.last_touched_at));
+
+    const withVersions = await runPooled(touched.map(meta => async () => ({
+        meta,
+        versions: await fetchTodayVersions(meta.key),
+    })), CONCURRENCY);
+
+    // last_touched_by only names the latest editor, so also accept files where
+    // any of today's versions was saved by me.
+    return withVersions.filter(({ meta, versions }) => {
+        if (!FIGMA_ONLY_MINE) return true;
+        const lastBy = meta.last_touched_by && meta.last_touched_by.id;
+        return lastBy === me.id || versions.today.some(v => v.user && v.user.id === me.id);
+    }).sort((x, y) => new Date(y.meta.last_touched_at) - new Date(x.meta.last_touched_at));
+}
+
+/* ---------------------------
+   FILE PICKER
+----------------------------*/
+
+function getArg(name) {
+    const i = process.argv.indexOf(name);
+    return i === -1 ? null : process.argv[i + 1] || "";
+}
+
+function ask(question) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise(resolve => rl.question(question, answer => { rl.close(); resolve(answer); }));
+}
+
+/**
+ * --all, or a non-interactive run (cron), takes every file.
+ * --file <key|url> takes one. Otherwise the user picks from a numbered list.
+ */
+async function pickFiles(files) {
+    const fileArg = getArg("--file");
+    if (fileArg !== null) {
+        const key = parseFileKey(fileArg);
+        const match = files.filter(f => f.meta.key === key);
+        if (!match.length) throw new Error(`File ${fileArg} was not touched today (or is not mine).`);
+        return match;
+    }
+
+    if (process.argv.includes("--all") || !process.stdin.isTTY) return files;
+
+    console.log("\nFiles touched today:\n");
+    console.log("   0) All files (full daily report)");
+    files.forEach((f, i) => {
+        const m = f.meta;
+        const by = m.last_touched_by ? m.last_touched_by.handle : "?";
+        const folder = m.folder_name ? `${m.folder_name} / ` : "";
+        console.log(`   ${i + 1}) ${folder}${m.name}  — ${formatTime(m.last_touched_at)} by ${by}, ${f.versions.today.length} version(s)`);
+    });
+
+    while (true) {
+        const answer = (await ask("\nSelect files (e.g. 1,3) or 0 for all [0]: ")).trim();
+        if (!answer || answer === "0" || answer.toLowerCase() === "a") return files;
+
+        const picks = answer.split(/[\s,]+/).map(Number);
+        if (picks.every(n => Number.isInteger(n) && n >= 1 && n <= files.length)) {
+            return [...new Set(picks)].map(n => files[n - 1]);
+        }
+        console.log("Invalid selection.");
+    }
+}
+
+/* ---------------------------
+   PER-FILE WORK SUMMARY
+----------------------------*/
+
+async function summarizeFile({ meta, versions }, budget) {
+    const key = meta.key;
+    console.log(`🧩 ${meta.name}`);
+
+    const comments = await fetchTodayComments(key);
+
+    const summary = {
+        file: meta.name,
+        folder: meta.folder_name || undefined,
+        url: meta.url || `https://www.figma.com/design/${key}`,
+        first_change: versions.today.length ? formatTime(versions.today[0].created_at) : undefined,
+        last_change: formatTime(meta.last_touched_at),
+        named_versions: versions.today
+            .filter(v => v.label || v.description)
+            .map(v => truncate([v.label, v.description].filter(Boolean).join(": "))),
+        comments: comments.map(c => truncate(`${c.user ? c.user.handle : "?"}: ${c.message}`)),
+    };
+
+    if (budget.diffDisabled) {
+        summary.note = "Design diff unavailable (Figma rate limit); summary built from versions and comments only.";
+    } else {
+        try {
+            const before = versions.baseline
+                ? await loadSnapshot(key, versions.baseline.id)
+                : { nodes: {}, other: 0, components: {} };
+            const after = await loadSnapshot(key, null);
+            const diff = diffSnapshots(before, after);
+
+            summary.created_today = !versions.baseline || undefined;
+            summary.size = diffSize(diff);
+            summary.changes = compactDiff(diff);
+        } catch (err) {
+            if (err instanceof RateLimitError) budget.diffDisabled = true;
+            console.warn(`⚠️  Diff skipped for ${meta.name}: ${err.message}`);
+            summary.note = "Design diff unavailable; summary built from versions and comments only.";
+        }
+    }
+
+    const worth = summary.size === undefined
+        ? 1 + summary.named_versions.length
+        : Math.ceil(Math.sqrt(summary.size));
+    summary.min_bullets = MIN_BULLETS_PER_FILE;
+    summary.max_bullets = Math.max(MIN_BULLETS_PER_FILE, Math.min(MAX_BULLETS_PER_FILE, worth));
+
+    return summary;
+}
 
 /* ---------------------------
    GROQ REQUEST HELPERS
@@ -686,10 +567,6 @@ function isRetryable(err) {
     if (!status) return true;
 
     return status === 429 || status >= 500;
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -756,103 +633,61 @@ async function requestCompletion(prompt) {
    GROQ REPORT GENERATION
  ----------------------------*/
 
-async function generateReport(data) {
-    const { result: simplified } = simplify(data);
+async function generateReport(summaries) {
+    const prompt = `You are writing a short daily work summary of Figma design work for a CEO who is not technical.
 
-    const prompt = `You are writing a short daily work summary for a CEO who is not technical.
-
-You receive commit messages grouped by repository. Each repository carries a commit_count,
-a total_lines count, and a min_bullets and max_bullets budget. Each commit carries lines
-(how many lines of code it changed), areas (the parts of the product its files touched),
-and bullets (how many bullets that commit is worth). Commits are ordered biggest first.
+You receive one entry per Figma file the designer worked on today. Each entry carries:
+- changes: what differs between the start of the day and now. pages_*, screens_* (top-level frames
+  and sections), components_* (reusable design components), text_changed (copy edits, old → new),
+  text_added / text_removed (counts of text layers), instances_added (component name → how many
+  times it was placed), moved (layers moved to a new parent), layers_added / layers_removed.
+- named_versions: versions the designer saved with a label or description. These are the
+  designer's own words about the work; trust them most.
+- comments: today's comments on the file.
+- created_today: the file did not exist before today.
+- note: present when the detailed changes could not be fetched.
+- min_bullets and max_bullets: the bullet budget for that file.
 
 GOAL:
-Say what got done today, in plain language, at the level of detail a CEO can skim.
+Say what design work got done today, in plain language, at the level of detail a CEO can skim.
 
 HARD RULES:
 
-Write between min_bullets and max_bullets bullets for each repository. Each repository has its own budget; do not share bullets between repositories. Fewer bullets is fine when the commits hold little; never stretch one small task into several bullets to reach max_bullets. Count each repository's bullets before answering.
-Give every commit exactly the number of bullets its bullets field says. That number is not negotiable.
-For a commit with bullets of 2 or more, write one main bullet naming the feature, then more bullets of the same kind, placed directly after it, for its most important sub-parts taken from its areas list. Never fold it into one bullet.
-All bullets are flat: same "*" marker, same indent level, no nesting, no indentation. Keep a commit's bullets together, main bullet first.
-Commits with bullets of 1 stay a single bullet.
-Every bullet counts toward its repository's min_bullets and max_bullets.
-Commits with bullets of 1 may be merged only when they are the same kind of change. A small commit about a different feature, screen, rule, or setting gets its own bullet - a fix to validation, an error display, a default setting, or a form guide is real work and must appear, even next to a huge commit.
-Many large commits that repeat the same kind of work (for example, many documentation or collection files) are one theme: cover that theme with its bullets, and spend the remaining bullets on the unrelated commits. Never let one theme fill the whole section.
-Keep the repository's bullets in the order the commits are given: biggest work first.
-Never merge two unrelated changes into one bullet just to write fewer bullets.
-Every bullet must come from actual commits. Never invent work to fill space.
-Never invent detail to fill a big commit's bullets - describe the areas its file paths actually name.
-Merge related small commits into one bullet.
-Keep repository names and order exactly as given.
-Skip a repository entirely if its commits say nothing meaningful.
+Write between min_bullets and max_bullets bullets for each file. Fewer is fine when the file holds little; never stretch one small change into several bullets.
+Name screens, pages and components by their real names when they are meaningful. Skip default names like "Frame 12", "Group 3", "Rectangle".
+Group related screens into one bullet (for example "Added 4 checkout screens: Cart, Shipping, Payment, Review").
+Summarize copy edits by what they touched; quote text only when it is short and meaningful.
+Mention comments only when they show a decision or feedback that was handled.
+Every bullet must come from the input. Never invent work.
+Keep files in the order given. Skip a file whose input says nothing meaningful.
 
 WRITING STYLE:
 
-Start each bullet with a plain verb: Added, Improved, Updated, Fixed, Enhanced.
-5 to 10 words per bullet.
-Use concrete numbers and feature names when the commits contain them.
-Bold a feature name with ** only when it is a real named feature.
-No jargon: no lifecycle, subsystem, architecture, capability, module, layer.
-No benefit claims, no explanations, no filler.
-
-GOOD (style and format only; real repositories get min_bullets to max_bullets bullets, so write more than these short examples show):
-
-## acme/storefront
-
-* Added **Dead Stock** detection for products with no sales for 60+ days
-* Added inventory cost and dead stock reporting
-* Improved stock health dashboard and analysis
-
-## acme/bank-portal
-
-* Added 36 business categories
-* Improved business account and onboarding forms
-* Updated KYC, validation, and business data handling
-
-GOOD (one commit with bullets: 4 - the main feature first, then its important parts right after it, all flat):
-
-## acme/field-ops
-
-* Added **Task Manager** for creating and assigning jobs to staff
-* Added task lists with filters, search, and paging
-* Added task notes and an activity history of who changed what
-* Added task reminders that respect each store's timezone
-
-BAD (padded, vague, and far too many bullets):
-
-* Enhanced visibility into engineering delivery
-* Streamlined administrative workflow for data ingestion
-* Improved data consistency across frontend and backend
-* Centralized enum management for business types
+Start each bullet with a plain verb: Designed, Added, Updated, Reworked, Refined, Fixed, Removed.
+5 to 12 words per bullet.
+Bold a screen or feature name with ** when it is a real named screen or feature.
+No jargon: no frame, instance, node, layer, auto layout, variant. Say screen, component, section, text.
+No benefit claims, no filler.
 
 OUTPUT FORMAT:
 
-# Today's Work
+# Today's Design Work
 
 ---
 
-## Repository Name
+## File Name
 
-* Main feature bullet
-* Important part of that feature
-* Another important part of that feature
-* Unrelated bullet
+* Bullet
+* Bullet
 
 INPUT:
-${JSON.stringify(simplified)}
+${JSON.stringify(summaries)}
 `;
     if (!GROQ_API_KEY) {
         throw new Error("GROQ_API_KEY is missing. Add it to .env (see .env.example).");
     }
 
-    for (const repo in simplified) {
-        const s = simplified[repo];
-        console.log(`   ${repo} - ${s.commit_count} commit(s), ${s.total_lines} line(s), ${s.min_bullets}-${s.max_bullets} bullet(s)`);
-    }
-
-    console.log(`🧠 Sending ${Object.keys(simplified).length} repo(s) to Newisty...`);
-
+    console.log(`🧠 Sending ${summaries.length} file(s) to Newisty...`);
     console.log(`⏳ Waiting for Newisty response (${MODEL})...`);
 
     const res = await requestCompletion(prompt);
@@ -866,11 +701,11 @@ ${JSON.stringify(simplified)}
     if (choice.finish_reason === "length") {
         console.warn(
             `⚠️  Report was TRUNCATED - hit max_completion_tokens (${MAX_COMPLETION_TOKENS}). ` +
-            "Raise MAX_COMPLETION_TOKENS or reduce the number of repositories."
+            "Raise MAX_COMPLETION_TOKENS or select fewer files."
         );
     }
 
-    return enforceBulletLimits(stripReasoning(choice.message.content), simplified);
+    return stripReasoning(choice.message.content);
 }
 
 /* ---------------------------
@@ -888,42 +723,8 @@ function ensureFolders() {
     return reportsDir;
 }
 
-/* ---------------------------
-   MAIN
-----------------------------*/
-
-async function main() {
-    console.log("🔍 Initializing system...");
-
-    console.log("📥 Fetching GitHub activity...");
-
-    const commits = await fetchCommits();
-
-    console.log(`✅ Fetched ${commits.length} commits`);
-
-    const prs = await fetchPRs();
-
-    console.log(`📦 Commits: ${commits.length}`);
-    console.log(`📦 PRs: ${prs.length}`);
-
-    const grouped = groupData(commits, prs);
-
-    await enrichWithStats(grouped);
-
-    console.log("🧠 Generating AI report...");
-
-    const report = await generateReport(grouped);
-
-    writeReportToFile(report);
-    const date = getDateString();
-
-    console.log("\n✅ DONE");
-    console.log("📄 today-work.md updated");
-    console.log(`📁 reports/${date}.md created`);
-}
-
 function writeReportToFile(report) {
-    const date = getDateString();
+    const date = getLocalDateString();
 
     const reportsDir = ensureFolders();
 
@@ -934,4 +735,46 @@ function writeReportToFile(report) {
     fs.writeFileSync(historyFile, report);
 }
 
-main().catch(console.error);
+/* ---------------------------
+   MAIN
+----------------------------*/
+
+async function main() {
+    console.log("🔍 Initializing system...");
+
+    if (!FIGMA_TOKEN) {
+        throw new Error("FIGMA_TOKEN is missing. Add it to .env (see .env.example).");
+    }
+
+    const me = await fetchMe();
+    console.log(`👤 Figma user: ${me.handle}`);
+
+    const files = await collectTodayFiles(me);
+
+    if (!files.length) {
+        console.log("📭 No Figma files touched today.");
+        return;
+    }
+
+    const selected = await pickFiles(files);
+    console.log(`\n📦 Reporting on ${selected.length} file(s)`);
+
+    const budget = { diffDisabled: false };
+    const summaries = [];
+    for (const file of selected) summaries.push(await summarizeFile(file, budget));
+
+    console.log("🧠 Generating AI report...");
+
+    const report = await generateReport(summaries);
+
+    writeReportToFile(report);
+
+    console.log("\n✅ DONE");
+    console.log("📄 today-work.md updated");
+    console.log(`📁 reports/${getLocalDateString()}.md created`);
+}
+
+main().catch(err => {
+    console.error(`❌ ${err.message}`);
+    process.exitCode = 1;
+});
